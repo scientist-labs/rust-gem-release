@@ -1,0 +1,75 @@
+name: Release
+
+# ============================================================================
+# red-candle's MIGRATED release workflow — the "after" of the extraction.
+#
+# BEFORE: red-candle/.github/workflows/release.yml was a 270-line, 5-job
+#   workflow that hand-rolled the source + x86_64-linux + aarch64-linux +
+#   arm64-darwin build/push/attach matrix inline.
+# AFTER (this file): a thin caller. It owns ONLY the bits a reusable
+#   (on: workflow_call) workflow cannot: the tag trigger, the contents:write
+#   token grant, and the per-gem inputs/secrets. Every build leg, SHA pin,
+#   and hard-won gotcha now lives once in the shared workflow.
+#
+# The inputs below pass red-candle's exact values, so the published gems are
+# byte-for-byte what release.yml produced for 1.8.0 (all 4 platforms, green
+# on 2026-06-18) — same aws-lc-sys cargo-config, same Metal/Accelerate verify,
+# same always-publish behavior (publish: true + the RUBYGEMS_API_KEY secret).
+#
+# Release procedure is unchanged (the tag drives it; a CI-created tag would
+# not re-trigger):
+#   1. bump lib/candle/version.rb
+#   2. git commit -am "Release vX.Y.Z"
+#   3. git tag X.Y.Z && git push origin HEAD --tags
+# ============================================================================
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"        # release:    1.8.0
+      - "[0-9]+.[0-9]+.[0-9]+.*"      # prerelease: 1.8.0.pre1, 1.8.0.rc2 (RubyGems dot form)
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+.*"
+
+# A reusable workflow can only REDUCE the inherited token scope, never elevate
+# it — so the caller MUST grant contents: write here (and the repo's default
+# workflow token must not be read-only) or `gh release create` 403s.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: scientist-labs/rust-gem-release/.github/workflows/release.yml@v0
+    with:
+      # --- name aliasing: gem-name != ext-name != gemspec basename ---
+      gem-name: red-candle
+      ext-name: candle
+      # gemspec could be omitted (resolves to <ext-name>.gemspec = candle.gemspec);
+      # shown explicit for clarity.
+      gemspec: candle.gemspec
+      version-command: ruby -r./lib/candle/version -e 'print Candle::VERSION'
+      ruby-versions: "3.1,3.2,3.3,3.4,4.0"
+      compile-command: bundle exec rake compile
+      # red-candle's gemspec reads RED_CANDLE_PLATFORM_GEM, not the generic default.
+      platform-gem-env: RED_CANDLE_PLATFORM_GEM
+      darwin-platform: arm64-darwin
+      # The aws-lc-sys gcc-95189 workaround — literal .cargo/config.toml text
+      # written on the x86_64-linux leg ONLY (release.yml lines 139-140).
+      x86_64-cargo-config: |
+        [env]
+        AWS_LC_SYS_CMAKE_BUILDER = "1"
+      # Extra darwin-leg assertion (release.yml line 203-204). $BUNDLE is exported
+      # by the shared workflow; the always-on arm64 `file` check stays hardcoded
+      # there and is NOT passed here.
+      darwin-verify-cmd: |
+        otool -L "$BUNDLE" | grep -Eiq '(Metal|Accelerate)\.framework' || { echo "::error::darwin build did not link Metal/Accelerate — CPU-only regression"; exit 1; }
+      # publish: true + the secret below reproduce today's always-publish behavior
+      # (the shared workflow defaults publish to false, which would dry-run).
+      publish: true
+      build-darwin: true
+      build-x86_64-linux: true
+      build-aarch64-linux: true
+    secrets:
+      # Caller maps its own secret by name; required: false in the shared workflow
+      # lets an omitting fork get a clean skip instead of a hard error.
+      rubygems-api-key: ${{ secrets.RUBYGEMS_API_KEY }}

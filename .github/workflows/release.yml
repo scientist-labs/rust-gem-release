@@ -1,0 +1,597 @@
+name: Reusable Rust Gem Release
+
+# =============================================================================
+# REUSABLE RELEASE WORKFLOW for scientist-labs Rust-backed Ruby gems.
+#
+# THIS IS A REUSABLE WORKFLOW (on: workflow_call), NOT a composite/JS/Docker
+# action: the four build legs are SEPARATE JOBS across two runner OSes
+# (ubuntu-24.04 + macos-26) with strategy.matrix, needs edges, and per-job
+# permissions — none of which a composite action can express.
+#
+# Extracted from red-candle's proven-green release.yml (red-candle 1.8.0 shipped
+# all four platforms to rubygems.org, 2026-06-18). Builds, for a pushed version
+# tag:
+#   - the source "ruby" gem            (universal fallthrough; needs Rust on install)
+#   - <gem>-<v>-x86_64-linux.gem       (precompiled, glibc)
+#   - <gem>-<v>-aarch64-linux.gem      (precompiled, glibc; CROSS-compiled on x86_64)
+#   - <gem>-<v>-arm64-darwin.gem       (precompiled; built NATIVELY on Apple Silicon)
+# Each fat gem carries one compiled extension per Ruby ABI in ruby-versions, so
+# consumers install with no Rust toolchain.
+#
+# -----------------------------------------------------------------------------
+# INPUTS (see each input's `description:` below for the full contract)
+#   gem-name            (REQUIRED) RubyGems package name; drives every push/attach glob.
+#   ext-name            Compiled extension / lib subdir name. Empty -> resolves to gem-name.
+#   gemspec             Gemspec FILE to `gem build`. Empty -> '<resolved-ext-name>.gemspec'.
+#   version-command     Shell command that prints the bare version; tag must equal it.
+#                       Default is red-candle's; EVERY other consumer MUST override.
+#   ruby-versions       CSV of Ruby ABIs compiled into every fat gem.
+#   compile-command     Native macOS compile entrypoint (darwin legs only).
+#   platform-gem-env    Env var name the gemspec reads to enter its precompiled branch.
+#   darwin-platform     Darwin platform string for the fat gem (default arm64-darwin).
+#   x86_64-cargo-config OPTIONAL .cargo/config.toml text, written on the x86_64-linux leg ONLY.
+#   darwin-verify-cmd   OPTIONAL extra shell run per darwin leg, with $BUNDLE exported.
+#   publish             Intent gate for `gem push` (default FALSE).
+#   build-darwin / build-x86_64-linux / build-aarch64-linux  per-leg toggles.
+#
+# SECRETS
+#   rubygems-api-key    OPTIONAL. Mapped into GEM_HOST_API_KEY by every push step.
+#                       Omitted -> empty -> push is a clean no-op (never used in any `if:`).
+#
+# OUTPUTS
+#   version, prerelease, ext-name, gemspec, release-url, published, platforms-built.
+#
+# -----------------------------------------------------------------------------
+# CONSUMER PREREQUISITES (the shared workflow CANNOT do these for you):
+#
+#   1. ABI REQUIRE-SHIM in lib/<gem>.rb — try the versioned native path first,
+#      fall back to flat, resolving through $LOAD_PATH (`require`, NOT
+#      `require_relative`, because RubyGems installs native extensions outside
+#      lib/). The require path uses <ext-name>, not <gem-name>:
+#        begin
+#          RUBY_VERSION =~ /(\d+\.\d+)/
+#          require "<ext>/#{Regexp.last_match(1)}/<ext>"
+#        rescue LoadError
+#          require "<ext>/<ext>"
+#        end
+#
+#   2. GEMSPEC ENV-GATED PLATFORM BRANCH — the gemspec must read the env var named
+#      by `platform-gem-env` (default RUST_GEM_PLATFORM) and, when set:
+#        spec.platform   = ENV["RUST_GEM_PLATFORM"]
+#        spec.extensions = []                       # no recompile-on-install
+#        spec.files     += Dir["lib/<ext>/*/<ext>.bundle"] + Dir["lib/<ext>/*/<ext>.so"]
+#      else declare `spec.extensions = ["ext/<ext>/extconf.rb"]`.
+#      Until BOTH the shim and this branch exist, the precompiled gems publish but
+#      simply won't load — only the SOURCE gem is usable.
+#
+#   3. CALLER WORKFLOW owns the tag trigger and the token grant. A reusable
+#      (workflow_call) workflow has NO on.push.tags. The caller supplies:
+#        on: { push: { tags: [ "[0-9]+.[0-9]+.[0-9]+", ... ] } }
+#        permissions: { contents: write }           # a reusable workflow can only
+#                                                    # REDUCE inherited token scope
+#        jobs.release.uses: scientist-labs/rust-gem-release/.github/workflows/release.yml@v0
+#      The repo's default workflow token must NOT be read-only or `gh release
+#      create` 403s. See examples/red-candle-release.yml.
+#
+# Third-party AND first-party actions are SHA-pinned (supply-chain). Comments show
+# the tag. Pins are centralized here so consumers inherit them.
+# =============================================================================
+
+on:
+  workflow_call:
+    inputs:
+      gem-name:
+        description: "RubyGems package NAME (REQUIRED). Drives every push/attach/asset glob. MUST stay distinct from gemspec basename and ext-name when they differ (red-candle: gem-name=red-candle, ext-name=candle)."
+        type: string
+        required: true
+      ext-name:
+        description: "Compiled extension / lib subdir name. Artifact lands at lib/<ext-name>/<ext-name>.bundle and lib/<ext-name>/<minor>/<ext-name>.bundle. EMPTY DEFAULT -> prepare resolves to gem-name. Only aliasing gems set it (red-candle=candle, indradb-ruby=indradb)."
+        type: string
+        required: false
+        default: ""
+      gemspec:
+        description: "Gemspec FILE passed to `gem build`. EMPTY DEFAULT -> prepare resolves to '<resolved-ext-name>.gemspec' (red-candle: candle.gemspec). prepare asserts the resolved file exists. indradb-ruby must set this explicitly (indradb-ruby.gemspec)."
+        type: string
+        required: false
+        default: ""
+      version-command:
+        description: "Shell command (run at repo root in prepare) printing the bare version to stdout; prepare guards the v-stripped tag equals it. Default is red-candle's; EVERY other consumer MUST override (e.g. `ruby -r./lib/parsekit/version -e 'print Parsekit::VERSION'`)."
+        type: string
+        required: false
+        default: "ruby -r./lib/candle/version -e 'print Candle::VERSION'"
+      ruby-versions:
+        description: "Comma-separated Ruby ABI set compiled into every fat gem. SINGLE SOURCE OF TRUTH: prepare derives the CSV (cross-gem), a JSON array (darwin matrix), and a space-list (darwin verify loop) from this one value."
+        type: string
+        required: false
+        default: "3.1,3.2,3.3,3.4,4.0"
+      compile-command:
+        description: "Native macOS compile entrypoint on darwin-build (one .bundle per ABI), the rake-compiler/rb_sys common case. The linux legs do NOT use this (oxidize-rb cross-gem owns the linux build)."
+        type: string
+        required: false
+        default: "bundle exec rake compile"
+      platform-gem-env:
+        description: "Env var name the consumer's gemspec reads to enter its precompiled-platform branch. darwin-package sets ENV[<this>]=<darwin-platform> before `gem build`. red-candle MUST override to RED_CANDLE_PLATFORM_GEM; new adopters use the generic default RUST_GEM_PLATFORM."
+        type: string
+        required: false
+        default: "RUST_GEM_PLATFORM"
+      darwin-platform:
+        description: "Darwin platform string for the fat gem and its push/attach/verify globs. NEVER intel darwin; publish the GENERIC arm64-darwin (RubyGems does not fall back across darwin majors)."
+        type: string
+        required: false
+        default: "arm64-darwin"
+      x86_64-cargo-config:
+        description: "OPTIONAL raw .cargo/config.toml text written at repo root on the x86_64-linux leg ONLY, BEFORE cross-gem runs. Empty default => no-op. red-candle sets the aws-lc-sys gcc-95189 workaround. The x86_64-ONLY scoping is HARDCODED."
+        type: string
+        required: false
+        default: ""
+      darwin-verify-cmd:
+        description: "OPTIONAL extra shell run on each darwin-build leg AFTER compile+relocate, with $BUNDLE exported as the relocated bundle. Empty default => skip. The arm64 file-check ALWAYS runs and stays HARDCODED; only this framework grep is gem-specific."
+        type: string
+        required: false
+        default: ""
+      publish:
+        description: "INTENT gate for `gem push` (lives in inputs so it is legal in `if:`/bash). DEFAULT FALSE: a tag still builds all gems, runs `gem build`, and creates/attaches the GitHub Release, but skips RubyGems push. Set true AND supply the secret to actually publish."
+        type: boolean
+        required: false
+        default: false
+      build-darwin:
+        description: "Toggle the native arm64-darwin legs (darwin-build + darwin-package) together via job-level `if:`. Off => a token-less or Linux-only gem still ships source + 2 linux platforms."
+        type: boolean
+        required: false
+        default: true
+      build-x86_64-linux:
+        description: "Toggle the x86_64-linux precompiled leg (per-step guard inside the linux-gems matrix). Off => amd64 users fall through to the source gem."
+        type: boolean
+        required: false
+        default: true
+      build-aarch64-linux:
+        description: "Toggle the aarch64-linux (cross-compiled on the x86_64 ubuntu-24.04 host) precompiled leg. Off => arm64-linux users fall through to the source gem. The cross-on-x86_64 topology stays HARDCODED."
+        type: boolean
+        required: false
+        default: true
+    secrets:
+      rubygems-api-key:
+        description: "RubyGems API key, mapped by every push step into GEM_HOST_API_KEY. required:false is load-bearing: an omitted secret resolves to '' and the in-step `[ -z ]` guard treats it as skip. NEVER referenced in any `if:`. The GitHub Release path uses github.token, not this key."
+        required: false
+    outputs:
+      version:
+        description: "Resolved gem version (pushed tag, leading 'v' stripped)."
+        value: ${{ jobs.prepare.outputs.version }}
+      prerelease:
+        description: "'true' if Gem::Version#prerelease? (drives the Release --prerelease flag)."
+        value: ${{ jobs.prepare.outputs.prerelease }}
+      ext-name:
+        description: "The resolved extension/lib-dir name (empty input resolved to gem-name)."
+        value: ${{ jobs.prepare.outputs.ext-name }}
+      gemspec:
+        description: "The resolved gemspec filename actually built."
+        value: ${{ jobs.prepare.outputs.gemspec }}
+      release-url:
+        description: "URL of the GitHub Release created/updated."
+        value: ${{ jobs.source-gem.outputs.release-url }}
+      published:
+        description: "'true' only if the source gem was actually pushed to RubyGems (publish=true AND token present AND not an idempotent repush-skip)."
+        value: ${{ jobs.source-gem.outputs.published }}
+      platforms-built:
+        description: "Comma-list of platform gems that built green (source,x86_64-linux,aarch64-linux,arm64-darwin)."
+        value: ${{ jobs.collect.outputs.platforms }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Guard + single-source-of-truth setup. Resolves empty ext-name/gemspec off
+  # gem-name (workflow_call inputs cannot self-reference), asserts the gemspec
+  # exists, guards the tag == version-command output, computes prerelease?, and
+  # derives the three ruby-version forms (CSV / JSON array / space-list) once.
+  # ---------------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+      ext-name: ${{ steps.resolve.outputs.ext-name }}
+      gemspec: ${{ steps.resolve.outputs.gemspec }}
+      ruby-json: ${{ steps.rubies.outputs.json }}
+      ruby-list: ${{ steps.rubies.outputs.list }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Resolve ext-name and gemspec (empty -> derived from gem-name)
+        id: resolve
+        env:
+          GEM_NAME: ${{ inputs.gem-name }}
+          EXT_NAME: ${{ inputs.ext-name }}
+          GEMSPEC: ${{ inputs.gemspec }}
+        run: |
+          ext="${EXT_NAME:-$GEM_NAME}"
+          gemspec="${GEMSPEC:-${ext}.gemspec}"
+          if [ ! -f "$gemspec" ]; then
+            echo "::error::resolved gemspec '$gemspec' not found. Add an explicit gemspec: input (e.g. gemspec: ${GEM_NAME}.gemspec) — gem-name, ext-name and the gemspec basename can all differ (red-candle: gem-name=red-candle, ext-name=candle, gemspec=candle.gemspec)."
+            exit 1
+          fi
+          echo "ext-name=$ext" >> "$GITHUB_OUTPUT"
+          echo "gemspec=$gemspec" >> "$GITHUB_OUTPUT"
+          echo "Resolved ext-name=$ext gemspec=$gemspec"
+      - name: Guard tag == version, compute prerelease
+        id: v
+        env:
+          VERSION_COMMAND: ${{ inputs.version-command }}
+          GEM_NAME: ${{ inputs.gem-name }}
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          FILE_VER="$(eval "$VERSION_COMMAND")" \
+            || { echo "::error::version-command failed to run; check the override quoting (got: $VERSION_COMMAND)"; exit 1; }
+          if [ "$TAG" != "$FILE_VER" ]; then
+            echo "::error::tag '$TAG' != version-command output ('$FILE_VER'). Bump the version before tagging."
+            exit 1
+          fi
+          PRE="$(ruby -rrubygems -e 'print Gem::Version.new(ARGV[0]).prerelease?' "$TAG")"
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRE" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${GEM_NAME} $TAG (prerelease=$PRE)"
+      - name: Derive Ruby-version forms (JSON array + space-list) from the CSV
+        id: rubies
+        env:
+          RUBY_VERSIONS: ${{ inputs.ruby-versions }}
+        run: |
+          JSON="$(ruby -rjson -e 'print ARGV[0].split(",").map(&:strip).to_json' "$RUBY_VERSIONS")"
+          LIST="$(ruby -e 'print ARGV[0].split(",").map(&:strip).join(" ")' "$RUBY_VERSIONS")"
+          echo "json=$JSON" >> "$GITHUB_OUTPUT"
+          echo "list=$LIST" >> "$GITHUB_OUTPUT"
+          echo "ruby-json=$JSON ruby-list=$LIST"
+
+  # ---------------------------------------------------------------------------
+  # Source gem (platform "ruby"). Pushed first and creates the GitHub Release, so
+  # a tag always yields at least an installable gem even if a native leg flakes.
+  # MANDATORY — no toggle. Release creation uses github.token, never the rubygems key.
+  # ---------------------------------------------------------------------------
+  source-gem:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      release-url: ${{ steps.release.outputs.release-url }}
+      published: ${{ steps.push.outputs.published }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: ruby/setup-ruby@89f90524b88a01fe6e0b732220432cc6142926af # v1.313.0
+        with:
+          ruby-version: "3.4"
+      - name: Build source gem
+        run: gem build "${{ needs.prepare.outputs.gemspec }}"
+      - name: Push source gem (idempotent; skip if publish off or no token)
+        id: push
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.rubygems-api-key }}
+          PUBLISH: ${{ inputs.publish }}
+          GEM_NAME: ${{ inputs.gem-name }}
+        run: |
+          # Default the output on EVERY path so a caller branching on
+          # `published == 'false'` (e.g. a "dry-run completed" notification)
+          # works on the skip paths, not just the real-push path. Only an
+          # actual `gem push` flips it to true below.
+          echo "published=false" >> "$GITHUB_OUTPUT"
+          if [ "$PUBLISH" != "true" ]; then
+            echo "::notice::publish=false (default); built + attached to Release but NOT pushed to RubyGems. Set publish:true to publish."
+            exit 0
+          fi
+          if [ -z "${GEM_HOST_API_KEY:-}" ]; then
+            echo "::warning::publish=true but no rubygems-api-key supplied; skipping push"
+            exit 0
+          fi
+          shopt -s nullglob
+          pushed=false
+          for gem in ${GEM_NAME}-*.gem; do
+            echo "==> $gem"
+            if ! out=$(gem push "$gem" 2>&1); then
+              echo "$out"
+              echo "$out" | grep -q "Repushing of gem versions is not allowed" \
+                && { echo "already published, skipping"; continue; }
+              exit 1
+            fi
+            pushed=true
+          done
+          echo "published=$pushed" >> "$GITHUB_OUTPUT"
+      - name: Create GitHub Release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GEM_NAME: ${{ inputs.gem-name }}
+        run: |
+          PRERELEASE_FLAG=""
+          [ "${{ needs.prepare.outputs.prerelease }}" = "true" ] && PRERELEASE_FLAG="--prerelease"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" ${GEM_NAME}-*.gem --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "v${{ needs.prepare.outputs.version }}" \
+              $PRERELEASE_FLAG --generate-notes ${GEM_NAME}-*.gem
+          fi
+          URL="$(gh release view "$GITHUB_REF_NAME" --json url --jq .url)"
+          echo "release-url=$URL" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Linux precompiled gems via oxidize-rb cross-gem. BOTH legs run on the x86_64
+  # ubuntu-24.04 host — aarch64 is CROSS-compiled (cross toolchain, not QEMU): a
+  # native arm runner trips the pinned cross-gem v1.4.4's cargo-binstall
+  # host-triple lookup (KeyError aarch64-unknown-linux-musl). Each leg's
+  # build/push/attach steps no-op when its toggle input is false. fail-fast:false.
+  # ---------------------------------------------------------------------------
+  linux-gems:
+    needs: [prepare, source-gem]
+    if: ${{ !cancelled() && needs.source-gem.result == 'success' && (inputs.build-x86_64-linux || inputs.build-aarch64-linux) }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86_64-linux
+            runs-on: ubuntu-24.04
+          - platform: aarch64-linux
+            # Cross-compiled on x86_64 (cross toolchain, not QEMU). The native
+            # ubuntu-24.04-arm host trips the pinned cross-gem's cargo-binstall
+            # host-triple lookup (KeyError aarch64-unknown-linux-musl).
+            runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - name: Decide whether this leg is enabled
+        id: leg
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          BUILD_X86_64: ${{ inputs.build-x86_64-linux }}
+          BUILD_AARCH64: ${{ inputs.build-aarch64-linux }}
+        run: |
+          enabled=false
+          if [ "$PLATFORM" = "x86_64-linux" ]  && [ "$BUILD_X86_64"  = "true" ]; then enabled=true; fi
+          if [ "$PLATFORM" = "aarch64-linux" ] && [ "$BUILD_AARCH64" = "true" ]; then enabled=true; fi
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+          [ "$enabled" = "true" ] && echo "==> building $PLATFORM" || echo "==> $PLATFORM toggled off; skipping"
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        if: steps.leg.outputs.enabled == 'true'
+      - uses: ruby/setup-ruby@89f90524b88a01fe6e0b732220432cc6142926af # v1.313.0
+        if: steps.leg.outputs.enabled == 'true'
+        with:
+          ruby-version: "3.4"
+      # OPTIONAL x86_64-ONLY cargo config (e.g. red-candle's aws-lc-sys gcc-95189
+      # workaround). cross-gem@v1.4.4 has no env input but bind-mounts the repo,
+      # so a .cargo/config.toml [env] at the repo root is read by cargo. Scoped to
+      # x86_64 only: the gcc panic is host==target specific, so aarch64-cross /
+      # darwin / source must never receive it. No-op when the input is empty.
+      - name: Write x86_64 cargo config (x86_64 leg only, when input non-empty)
+        if: ${{ steps.leg.outputs.enabled == 'true' && matrix.platform == 'x86_64-linux' && inputs.x86_64-cargo-config != '' }}
+        env:
+          CARGO_CONFIG: ${{ inputs.x86_64-cargo-config }}
+        run: |
+          mkdir -p .cargo
+          printf '%s' "$CARGO_CONFIG" > .cargo/config.toml
+          echo "Wrote .cargo/config.toml:"
+          cat .cargo/config.toml
+      - uses: oxidize-rb/actions/cross-gem@e5f9a49a7812a078584072f6e3f657ad247c8771 # v1.4.4
+        if: steps.leg.outputs.enabled == 'true'
+        id: cross-gem
+        with:
+          platform: ${{ matrix.platform }}
+          ruby-versions: ${{ inputs.ruby-versions }}
+      - name: Push ${{ matrix.platform }} gem (idempotent; skip if publish off or no token)
+        if: steps.leg.outputs.enabled == 'true'
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.rubygems-api-key }}
+          PUBLISH: ${{ inputs.publish }}
+          GEM_PATHS: ${{ steps.cross-gem.outputs.gem-path }}
+        run: |
+          if [ "$PUBLISH" != "true" ]; then
+            echo "::notice::publish=false (default); built ${{ matrix.platform }} gem + attached to Release but NOT pushed to RubyGems. Set publish:true to publish."
+            exit 0
+          fi
+          if [ -z "${GEM_HOST_API_KEY:-}" ]; then
+            echo "::warning::publish=true but no rubygems-api-key supplied; skipping push"
+            exit 0
+          fi
+          # Under publish=true, a silent cross-gem failure (empty gem-path) must
+          # surface as an error, not a no-op push that looks green.
+          if [ -z "${GEM_PATHS// }" ]; then
+            echo "::error::cross-gem produced no gem-path for ${{ matrix.platform }}; nothing to push"
+            exit 1
+          fi
+          for gem in $GEM_PATHS; do
+            echo "==> $gem"
+            if ! out=$(gem push "$gem" 2>&1); then
+              echo "$out"
+              echo "$out" | grep -q "Repushing of gem versions is not allowed" \
+                && { echo "already published, skipping"; continue; }
+              exit 1
+            fi
+          done
+      # `|| true` makes a Release-asset upload failure NON-FATAL by design: the
+      # gem is already on RubyGems (the source of truth); the Release asset is a
+      # convenience mirror, so a transient upload glitch must not fail the run.
+      - name: Attach to GitHub Release
+        if: steps.leg.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" ${{ steps.cross-gem.outputs.gem-path }} --clobber || true
+
+  # ---------------------------------------------------------------------------
+  # arm64-darwin: built NATIVELY on Apple Silicon (macos-26). The oxidize-rb/rb-sys
+  # cross path is Linux/Docker-only and produces a CPU-only darwin binary (frameworks
+  # can't link under osxcross). Compile one .bundle per Ruby ABI here, then assemble
+  # them in darwin-package. The whole darwin sub-chain skips as a unit when
+  # build-darwin is false (job-level `if:`).
+  # ---------------------------------------------------------------------------
+  darwin-build:
+    needs: prepare
+    if: ${{ inputs.build-darwin }}
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ${{ fromJSON(needs.prepare.outputs.ruby-json) }}
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: oxidize-rb/actions/setup-ruby-and-rust@e5f9a49a7812a078584072f6e3f657ad247c8771 # v1.4.4
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          rustup-toolchain: stable
+          bundler-cache: true
+      - name: Compile native extension
+        run: ${{ inputs.compile-command }}
+      - name: Relocate bundle into Ruby-ABI subdir
+        env:
+          MINOR: ${{ matrix.ruby }}
+          EXT_NAME: ${{ needs.prepare.outputs.ext-name }}
+        run: |
+          test -f "lib/${EXT_NAME}/${EXT_NAME}.bundle"
+          mkdir -p "lib/${EXT_NAME}/${MINOR}"
+          mv "lib/${EXT_NAME}/${EXT_NAME}.bundle" "lib/${EXT_NAME}/${MINOR}/${EXT_NAME}.bundle"
+      - name: Verify arm64 (hardcoded) + optional framework linkage
+        env:
+          MINOR: ${{ matrix.ruby }}
+          EXT_NAME: ${{ needs.prepare.outputs.ext-name }}
+          DARWIN_VERIFY_CMD: ${{ inputs.darwin-verify-cmd }}
+        run: |
+          export BUNDLE="lib/${EXT_NAME}/${MINOR}/${EXT_NAME}.bundle"
+          file "$BUNDLE"
+          file "$BUNDLE" | grep -q arm64 \
+            || { echo "::error::$BUNDLE is not arm64 — wrong runner?"; exit 1; }
+          if [ -n "$DARWIN_VERIFY_CMD" ]; then
+            echo "Running darwin-verify-cmd against $BUNDLE"
+            eval "$DARWIN_VERIFY_CMD" \
+              || { echo "::error::darwin-verify-cmd failed (exit $?). A real linkage regression OR a malformed override — check the command's own error above and its quoting."; exit 1; }
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: darwin-bundle-${{ matrix.ruby }}
+          path: lib/${{ needs.prepare.outputs.ext-name }}/${{ matrix.ruby }}/${{ needs.prepare.outputs.ext-name }}.bundle
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Assemble the per-ABI .bundles into ONE arm64-darwin fat gem, push, attach.
+  # The gemspec's platform-gem-env branch sets platform=<darwin-platform>, clears
+  # spec.extensions (no recompile-on-install), and packs the bundles. We publish
+  # the GENERIC darwin platform: RubyGems does not fall back across darwin majors.
+  # The !cancelled() + result gate keeps the needs-edge valid when darwin is off.
+  # ---------------------------------------------------------------------------
+  darwin-package:
+    needs: [prepare, source-gem, darwin-build]
+    if: ${{ inputs.build-darwin && !cancelled() && needs.source-gem.result == 'success' && (needs.darwin-build.result == 'success' || needs.darwin-build.result == 'skipped') }}
+    runs-on: macos-26
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: ruby/setup-ruby@89f90524b88a01fe6e0b732220432cc6142926af # v1.313.0
+        with:
+          ruby-version: "3.4"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: darwin-bundle-*
+          path: darwin-bundles
+      - name: Reassemble per-ABI bundle layout
+        env:
+          EXT_NAME: ${{ needs.prepare.outputs.ext-name }}
+        run: |
+          for d in darwin-bundles/darwin-bundle-*; do
+            minor="${d##*darwin-bundle-}"
+            mkdir -p "lib/${EXT_NAME}/${minor}"
+            mv "${d}/${EXT_NAME}.bundle" "lib/${EXT_NAME}/${minor}/${EXT_NAME}.bundle"
+          done
+          echo "Assembled ABIs:"; ls -1 lib/${EXT_NAME}/*/${EXT_NAME}.bundle
+      - name: Build ${{ inputs.darwin-platform }} fat gem
+        env:
+          DARWIN_PLATFORM: ${{ inputs.darwin-platform }}
+          PLATFORM_GEM_ENV: ${{ inputs.platform-gem-env }}
+          GEMSPEC: ${{ needs.prepare.outputs.gemspec }}
+        run: |
+          export "${PLATFORM_GEM_ENV}=${DARWIN_PLATFORM}"
+          gem build "$GEMSPEC"
+      - name: Verify fat gem carries every ABI bundle
+        env:
+          EXT_NAME: ${{ needs.prepare.outputs.ext-name }}
+          GEM_NAME: ${{ inputs.gem-name }}
+          DARWIN_PLATFORM: ${{ inputs.darwin-platform }}
+          RUBY_LIST: ${{ needs.prepare.outputs.ruby-list }}
+        run: |
+          GEM="$(ls ${GEM_NAME}-*-${DARWIN_PLATFORM}.gem)"
+          echo "Inspecting $GEM"
+          DATA="$(tar -xOf "$GEM" data.tar.gz | tar -tzf -)"
+          echo "$DATA" | grep -E "lib/${EXT_NAME}/[0-9.]+/${EXT_NAME}\.bundle" || true
+          for v in $RUBY_LIST; do
+            echo "$DATA" | grep -q "lib/${EXT_NAME}/${v}/${EXT_NAME}.bundle" \
+              || { echo "::error::fat gem missing ABI ${v}"; exit 1; }
+          done
+      - name: Push ${{ inputs.darwin-platform }} gem (idempotent; skip if publish off or no token)
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.rubygems-api-key }}
+          PUBLISH: ${{ inputs.publish }}
+          GEM_NAME: ${{ inputs.gem-name }}
+          DARWIN_PLATFORM: ${{ inputs.darwin-platform }}
+        run: |
+          if [ "$PUBLISH" != "true" ]; then
+            echo "::notice::publish=false (default); built ${DARWIN_PLATFORM} gem + attached to Release but NOT pushed to RubyGems. Set publish:true to publish."
+            exit 0
+          fi
+          if [ -z "${GEM_HOST_API_KEY:-}" ]; then
+            echo "::warning::publish=true but no rubygems-api-key supplied; skipping push"
+            exit 0
+          fi
+          shopt -s nullglob
+          for gem in ${GEM_NAME}-*-${DARWIN_PLATFORM}.gem; do
+            echo "==> $gem"
+            if ! out=$(gem push "$gem" 2>&1); then
+              echo "$out"
+              echo "$out" | grep -q "Repushing of gem versions is not allowed" \
+                && { echo "already published, skipping"; continue; }
+              exit 1
+            fi
+          done
+      # `|| true` makes a Release-asset upload failure NON-FATAL by design (the
+      # gem is already on RubyGems; the Release asset is a convenience mirror).
+      - name: Attach to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GEM_NAME: ${{ inputs.gem-name }}
+          DARWIN_PLATFORM: ${{ inputs.darwin-platform }}
+        run: gh release upload "$GITHUB_REF_NAME" ${GEM_NAME}-*-${DARWIN_PLATFORM}.gem --clobber || true
+
+  # ---------------------------------------------------------------------------
+  # OPTIONAL post-join aggregator: composes the platforms-built comma-list from
+  # each leg's result. The only GHA-correct place to fan a per-platform list out
+  # of matrix jobs (which collapse to one output). Pure reporting; uses result
+  # checks (never the all-success default) so a toggled-off leg never fails the run.
+  # ---------------------------------------------------------------------------
+  collect:
+    needs: [prepare, source-gem, linux-gems, darwin-build, darwin-package]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      platforms: ${{ steps.agg.outputs.platforms }}
+    steps:
+      - name: Aggregate platforms built
+        id: agg
+        env:
+          SOURCE_RESULT: ${{ needs.source-gem.result }}
+          LINUX_RESULT: ${{ needs.linux-gems.result }}
+          DARWIN_RESULT: ${{ needs.darwin-package.result }}
+          BUILD_X86_64: ${{ inputs.build-x86_64-linux }}
+          BUILD_AARCH64: ${{ inputs.build-aarch64-linux }}
+          DARWIN_PLATFORM: ${{ inputs.darwin-platform }}
+        run: |
+          parts=""
+          add() { if [ -z "$parts" ]; then parts="$1"; else parts="${parts},$1"; fi; }
+          [ "$SOURCE_RESULT" = "success" ] && add "source"
+          if [ "$LINUX_RESULT" = "success" ]; then
+            [ "$BUILD_X86_64"  = "true" ] && add "x86_64-linux"
+            [ "$BUILD_AARCH64" = "true" ] && add "aarch64-linux"
+          fi
+          [ "$DARWIN_RESULT" = "success" ] && add "$DARWIN_PLATFORM"
+          echo "platforms=$parts" >> "$GITHUB_OUTPUT"
+          echo "platforms-built=$parts"

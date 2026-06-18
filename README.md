@@ -1,0 +1,266 @@
+# rust-gem-release
+
+> **This is a reusable GitHub Actions *workflow*, not an action.** You call it with
+> `uses:` at the **job** level (`jobs.<id>.uses:`), never as a step. It declares
+> `on: workflow_call`, fans out a `strategy.matrix`, and spans two runner OSes
+> (`ubuntu-24.04` + `macos-26`) with `needs` edges and per-job `permissions` — none of
+> which a composite/JS/Docker action can do. The repo is `scientist-labs/rust-gem-release`;
+> see [Repo name](#repo-name-reusable-workflow-not-an-action) for naming and versioning.
+
+A single reusable workflow that turns a Rust-backed Ruby gem (Magnus / rb-sys /
+rake-compiler) into a full set of **precompiled, install-without-a-toolchain gems** on
+every tag, plus a **source gem** as the universal fallthrough:
+
+| Platform | How it's built | Who it serves |
+| --- | --- | --- |
+| `arm64-darwin` | **Natively** on `macos-26` (Apple Silicon), one `.bundle` per Ruby ABI | every `arm64-darwin-NN` macOS user (generic platform; RubyGems does not fall back across darwin majors) |
+| `x86_64-linux` | `oxidize-rb/cross-gem` on `ubuntu-24.04` | glibc amd64 |
+| `aarch64-linux` | **Cross-compiled** from the `x86_64` `ubuntu-24.04` host via `cross-gem` | glibc arm64 |
+| source (`ruby`) | `gem build` on `ubuntu-24.04`, pushed **first**, **creates the GitHub Release** | any ABI/platform outside the matrix (compiles Rust on install) |
+
+Publishing to RubyGems is **off by default** and a clean no-op without a token — a new
+gem can dry-run the entire 4-target matrix before it owns a RubyGems API key.
+
+The canonical consumer is **[red-candle](https://github.com/scientist-labs/red-candle)**
+(`red-candle` 1.8.0 shipped all four platforms from this workflow). Its full caller lives
+at [`examples/red-candle-release.yml`](examples/red-candle-release.yml).
+
+---
+
+## 2-minute quickstart
+
+A plain CPU-only gem (e.g. `parsekit`, `tokenkit`, `spellkit`) needs ~6 lines. Create
+`.github/workflows/release.yml` **in the consumer repo**:
+
+```yaml
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+.*"     # prereleases: 1.2.0.rc1
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+.*"
+
+jobs:
+  release:
+    permissions:
+      contents: write              # REQUIRED — the workflow can only reduce, never raise, this
+    uses: scientist-labs/rust-gem-release/.github/workflows/release.yml@v0
+    with:
+      gem-name: parsekit
+      version-command: ruby -r./lib/parsekit/version -e 'print Parsekit::VERSION'
+      publish: true                # omit or set false to dry-run (build + Release, no RubyGems push)
+    secrets:
+      rubygems-api-key: ${{ secrets.RUBYGEMS_API_KEY }}
+```
+
+That's it for a gem where `gem-name == gemspec basename == extension dir` (true for
+`parsekit`/`tokenkit`/`spellkit`/`clusterkit`/`lancelot`/`phrasekit`/`fastsheet`).
+
+> **`version-command` is the one input you almost always override** and the single most
+> likely silent break for a new adopter. Its default is red-candle's exact command
+> (`ruby -r./lib/candle/version -e 'print Candle::VERSION'`); every other gem must point
+> it at its own version constant. The `prepare` job runs this command and **fails the run
+> fast** unless the v-stripped pushed tag equals its output.
+
+> Before the precompiled darwin/linux gems will actually *load*, the consumer also needs
+> two small code changes — see [Consumer prerequisites](#consumer-prerequisites). Until
+> then the source gem still works everywhere; the precompiled gems publish but won't
+> `require`.
+
+---
+
+## Inputs
+
+| Input | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `gem-name` | string | **yes** | — | RubyGems package **name**. The only required input. Drives every push/attach glob: `gem push <gem-name>-*.gem`, `<gem-name>-*-<darwin-platform>.gem`, `gh release upload <gem-name>-*.gem`. Keep it distinct from the gemspec basename and `ext-name` when they differ (`red-candle` ≠ ext `candle`; `indradb-ruby` ≠ ext `indradb`). |
+| `ext-name` | string | no | `""` → `gem-name` | Compiled extension / `lib/` subdir name. Artifact lands at `lib/<ext-name>/<ext-name>.bundle` and the ABI subdir `lib/<ext-name>/<minor>/<ext-name>.bundle`; the gemspec packs `Dir['lib/<ext-name>/*/<ext-name>.bundle']`. Literal default is the **empty string** (a `workflow_call` input cannot default to another input); `prepare` resolves empty → `gem-name` and exposes the result as an output. Only aliasing gems set it (`red-candle`→`candle`, `indradb-ruby`→`indradb`). |
+| `gemspec` | string | no | `""` → `<ext-name>.gemspec` | Gemspec **file** passed to `gem build` in both the source-gem and darwin-package jobs. Literal default is the empty string; `prepare` resolves empty → `<resolved-ext-name>.gemspec` and **asserts the file exists**, emitting a `::error::` with the exact override to add if not. `red-candle`'s file is `candle.gemspec` (tracks ext-name, served by the default once `ext-name: candle` is set). `indradb-ruby` must set this explicitly (`indradb-ruby.gemspec`). |
+| `version-command` | string | no | `ruby -r./lib/candle/version -e 'print Candle::VERSION'` | Shell command (run at repo root in `prepare`) that prints the bare version to stdout. `prepare` guards that the v-stripped pushed tag equals it. The default is red-candle's exact command, so **every other consumer must override** (e.g. `ruby -r./lib/parsekit/version -e 'print Parsekit::VERSION'`). Kept as one full command so a gem whose version lives somewhere unusual is still served. |
+| `ruby-versions` | string | no | `3.1,3.2,3.3,3.4,4.0` | Comma-separated Ruby ABI set compiled into every fat gem (floor = gemspec `required_ruby_version` 3.1; 3.3 = rx prod; 4.0 = GA). **Single source of truth:** `prepare` derives all three forms from this one CSV — the CSV verbatim for cross-gem's `ruby-versions` on the linux legs, a JSON array for the darwin build matrix, and a space-list for the darwin per-ABI verify loop — so they cannot drift. A higher-floor gem can trim it (e.g. `3.3,3.4,4.0`) to cut darwin matrix minutes. |
+| `compile-command` | string | no | `bundle exec rake compile` | Native macOS compile entrypoint on `darwin-build` (one `.bundle` per ABI) — the rake-compiler/rb_sys common case. Override only for a different build entrypoint. The **linux legs do not use this** (cross-gem owns the linux build invocation). Runner labels are deliberately not exposed. |
+| `platform-gem-env` | string | no | `RUST_GEM_PLATFORM` | Name of the env var the consumer's gemspec reads to enter its precompiled-platform branch (set `spec.platform`, clear `spec.extensions`, pack the bundles). `darwin-package` exports `ENV[<this>]=<darwin-platform>` before `gem build`. red-candle's gemspec reads `RED_CANDLE_PLATFORM_GEM`, so red-candle **must override** to that; **new adopters write their gemspec branch to read the generic default** `RUST_GEM_PLATFORM` and pass nothing. Inert until the consumer adds the gemspec branch ([prerequisite #2](#consumer-prerequisites)). |
+| `darwin-platform` | string | no | `arm64-darwin` | Darwin platform string for the fat gem and its push/attach/verify globs. **Never intel darwin** — the generic `arm64-darwin` is what serves every `arm64-darwin-NN` user (RubyGems does not fall back across darwin majors). Exposed only so a hypothetical future target could differ; `arm64-darwin` is the only value red-candle ships. |
+| `x86_64-cargo-config` | string | no | `""` (no-op) | **Optional** raw `.cargo/config.toml` text written at the repo root on the **`x86_64-linux` leg only**, *before* cross-gem runs (cross-gem bind-mounts the repo, so cargo reads it). Empty default makes the write a no-op (correct for every surveyed consumer). red-candle sets the `aws-lc-sys` gcc-95189 workaround `[env]\nAWS_LC_SYS_CMAKE_BUILDER = "1"`. The x86_64-only scoping is **hardcoded** (the gcc panic is host==target specific); only the config *text* is the input. |
+| `darwin-verify-cmd` | string | no | `""` (skip) | **Optional** extra shell run on each `darwin-build` leg after compile+relocate, with `$BUNDLE` exported as the freshly-relocated `lib/<ext-name>/<minor>/<ext-name>.bundle`. Empty default skips it (correct for plain CPU-only gems). red-candle asserts framework linkage via `otool -L "$BUNDLE" \| grep -Eiq '(Metal\|Accelerate)\.framework'`. The arm64 architecture check (`file "$BUNDLE" \| grep -q arm64`) **always runs and is hardcoded** — only the framework grep is gem-specific. |
+| `publish` | boolean | no | `false` | **Intent gate** for `gem push`. Lives in `inputs` (not `secrets`) so it is legal in step `if:` and bash guards. **Default `false`** per the safety mandate: a tag still builds all gems, runs `gem build`, and creates/attaches the GitHub Release, but **skips the RubyGems push**, emitting a loud `::notice::`. Set `true` **and** supply the secret to actually publish. |
+| `build-darwin` | boolean | no | `true` | Toggle the native `arm64-darwin` legs (`darwin-build` + `darwin-package`) together, via job-level `if: inputs.build-darwin` on both. Off ⇒ a token-less or Linux-only gem still ships source + the two linux platforms. The native `macos-26` path is hardcoded (the Docker/osxcross cross path yields CPU-only darwin). |
+| `build-x86_64-linux` | boolean | no | `true` | Toggle the `x86_64-linux` precompiled leg, via a per-step guard inside the `linux-gems` matrix (you cannot job-`if` a single matrix include). Off ⇒ amd64 users fall through to the source gem. `fail-fast: false` keeps one leg's flake from cancelling the other. |
+| `build-aarch64-linux` | boolean | no | `true` | Toggle the `aarch64-linux` (cross-compiled on the `x86_64` host) leg, same per-step-guard mechanism. Off ⇒ arm64-linux users fall through to the source gem. The cross-on-x86_64 topology is **hardcoded** (a native arm runner trips cross-gem v1.4.4's `cargo-binstall` `KeyError aarch64-unknown-linux-musl`). |
+
+## Secrets
+
+| Secret | Required | Description |
+| --- | --- | --- |
+| `rubygems-api-key` | no | RubyGems API key, mapped by every push step into `GEM_HOST_API_KEY` via `env:`. `required: false` is **load-bearing**: an omitted optional secret resolves to the empty string (not a hard "secret not provided" error), which the in-step `[ -z "$GEM_HOST_API_KEY" ]` guard treats as *skip* — so OSS forks, dry-runs, and `publish: false` get a clean no-op. Map your own secret by name: `rubygems-api-key: ${{ secrets.RUBYGEMS_API_KEY }}`. **Never referenced in any `if:`** (the `secrets` context is absent from both job-if and step-if). The GitHub Release uses `github.token`, not this key, so a tag yields a source gem + Release even with no key. Prefer this explicit named secret over `secrets: inherit`. |
+
+## Outputs
+
+| Output | Description |
+| --- | --- |
+| `version` | Resolved gem version (pushed tag, leading `v` stripped). |
+| `prerelease` | `'true'` if `Gem::Version#prerelease?` (drives the Release `--prerelease` flag). |
+| `ext-name` | The resolved extension/lib-dir name (empty input resolved to `gem-name`); exposed for reuse in chained jobs. |
+| `gemspec` | The resolved gemspec filename actually built. |
+| `release-url` | URL of the GitHub Release created/updated (emitted from the non-matrix `source-gem` job, so it surfaces reliably). |
+| `published` | `'true'` only if the source gem was actually pushed (`publish: true` **and** token present **and** not an idempotent repush-skip). Kept on the non-matrix `source-gem` job deliberately — a matrix job surfaces only its last entry's output. Lets a caller chain notify/smoke-install on a real publish. |
+| `platforms-built` | Comma-list of platform gems that built green (`source,x86_64-linux,aarch64-linux,arm64-darwin`), aggregated in a tiny post-join `collect` job. Optional; the only GHA-correct place to assemble a per-platform list, since matrix jobs collapse to one output. |
+
+---
+
+## Consumer prerequisites
+
+The shared workflow builds and packs the binaries, but **two small changes must live in
+the consumer repo** before a precompiled gem will `require` at install time. Until both
+exist, the source gem works everywhere and the precompiled gems publish but won't load.
+The greenfield gems
+(`parsekit`/`tokenkit`/`spellkit`/`clusterkit`/`lancelot`/`phrasekit`/`fastsheet`/`indradb-ruby`)
+currently ship neither — **this is the real adoption blocker, not the caller YAML.**
+
+### 1. ABI require-shim in `lib/<gem>.rb`
+
+Try the Ruby-ABI-versioned native path first, fall back to the flat one. Resolution
+**must** go through `$LOAD_PATH` (`require`, never `require_relative`) because RubyGems
+installs native extensions outside the gem's `lib/` dir. Exact red-candle form
+([`lib/candle.rb` lines 10-15](https://github.com/scientist-labs/red-candle/blob/main/lib/candle.rb#L10-L15)):
+
+```ruby
+begin
+  RUBY_VERSION =~ /(\d+\.\d+)/
+  require "candle/#{Regexp.last_match(1)}/candle"
+rescue LoadError
+  require "candle/candle"
+end
+```
+
+The require path uses **`<ext-name>`**, not `<gem-name>` (e.g. `indradb/3.4/indradb`
+then `indradb/indradb`).
+
+### 2. Gemspec env-gated platform branch
+
+The gemspec must read the env var named by `platform-gem-env` and, when set, set
+`spec.platform`, **clear `spec.extensions = []`** (so RubyGems does not recompile from
+Rust on install), and add the per-ABI binaries. Exact red-candle form
+([`candle.gemspec` lines 32-38](https://github.com/scientist-labs/red-candle/blob/main/candle.gemspec#L32-L38)):
+
+```ruby
+if (platform_gem = ENV["RED_CANDLE_PLATFORM_GEM"])
+  spec.platform   = platform_gem
+  spec.extensions = []
+  spec.files     += Dir["lib/candle/*/candle.bundle"] + Dir["lib/candle/*/candle.so"]
+else
+  spec.extensions = ["ext/candle/extconf.rb"]
+end
+```
+
+**New adopters should read the generic default `RUST_GEM_PLATFORM`** here (and pass no
+`platform-gem-env` input). red-candle reads `RED_CANDLE_PLATFORM_GEM`, so it overrides
+`platform-gem-env` to match.
+
+### 3. Caller workflow owns the tag trigger and the token grant
+
+A `workflow_call` workflow has no `on: push: tags`. The **caller** supplies
+`on: push: tags: [ … ]` and a job with `permissions: contents: write`. A reusable
+workflow can only *reduce*, never elevate, the inherited token scope, so if the calling
+job omits `contents: write` (or the repo's default token is read-only),
+`gh release create` 403s. See [`examples/red-candle-release.yml`](examples/red-candle-release.yml).
+
+---
+
+## Gotchas this workflow handles for you
+
+These are hard-won from a multi-round incident. The workflow bakes each one in so you
+don't rediscover them:
+
+1. **aarch64-on-x86_64-host cross-compile.** `aarch64-linux` is cross-compiled on the
+   `x86_64` `ubuntu-24.04` host, **not** on a native arm runner — the pinned cross-gem
+   v1.4.4's `cargo-binstall` host-triple lookup throws `KeyError aarch64-unknown-linux-musl`
+   on an arm host. The topology is hardcoded; runner labels are never exposed as inputs.
+2. **Optional `aws-lc-sys` cargo-config.** A gem with a TLS dep can hit `aws-lc-sys`'s
+   `cc`-builder panic under rb-sys-dock's `x86_64` gcc (gcc bug 95189). Set
+   `x86_64-cargo-config` to `[env]\nAWS_LC_SYS_CMAKE_BUILDER = "1"`; the workflow writes
+   it to `.cargo/config.toml` **only on the x86_64 leg, before cross-gem** (the panic is
+   host==target specific, so aarch64/darwin/source must never get it).
+3. **Native darwin Metal.** `arm64-darwin` is built natively on `macos-26`; the
+   oxidize-rb/rb-sys cross path is Linux/Docker-only and yields a CPU-only darwin binary
+   (frameworks can't link under osxcross). Use `darwin-verify-cmd` to assert your
+   framework linkage (red-candle greps `otool -L` for `Metal`/`Accelerate`).
+4. **Generic `arm64-darwin` platform.** The fat gem publishes the *generic*
+   `arm64-darwin` platform, because RubyGems does not fall back across darwin majors — a
+   generic gem is what serves every `arm64-darwin-NN` user. Intel darwin is never built.
+5. **Idempotent push.** A `gem push` that prints `Repushing of gem versions is not
+   allowed` is treated as success (skip), so a partial re-run of a tag never fails.
+6. **Source-gem-first.** The source (`ruby`) gem is built, pushed, and **creates the
+   GitHub Release first**, so a tag always yields ≥1 installable gem and a Release for
+   the native legs to attach to, even if a native leg flakes.
+
+> **Darwin fat gem is all-or-nothing per run.** The arm64-darwin gem packs *every*
+> Ruby ABI in `ruby-versions`, and `darwin-package` fails the run if any ABI bundle is
+> missing. So a single-ABI compile failure on `darwin-build` (matrix `fail-fast: false`)
+> drops the *entire* arm64-darwin gem for that run — the source + linux gems may already
+> be published, but the darwin gem won't assemble until you re-run. The whole release is
+> idempotent (idempotent push + `--clobber` attach), so a re-run after fixing the ABI
+> simply fills in the darwin gem.
+
+---
+
+## Publishing
+
+Publishing is gated by a **triad** — an intent flag, an optional secret, and an in-step
+bash guard — so the `secrets` context is never touched in a conditional (where
+`if: secrets.X != ''` silently evaluates empty and is always false):
+
+1. **`publish` (boolean input, default `false`)** gates *intent* and is legal in `if:`/bash.
+2. **`rubygems-api-key` (secret, `required: false`)** — an omitted secret resolves to `''`
+   with no hard error.
+3. Every push step (source-gem, linux-gems, darwin-package) maps the secret into
+   `GEM_HOST_API_KEY` and branches in bash:
+   - `publish != true` ⇒ `exit 0` with a loud `::notice::` (built + attached to the
+     Release, **not** pushed).
+   - token empty ⇒ `exit 0` with a `::warning::`.
+   - otherwise ⇒ idempotent `gem push` (the "Repushing…" skip from gotcha #5).
+
+So publishing is a **clean no-op when *either* the flag is off *or* the token is absent**.
+`gem build` **always** runs, so a dry-run still validates packaging across all four
+targets — ideal for a greenfield gem (`tokenkit`/`spellkit`/`fastsheet`) that has no
+RubyGems key yet. The GitHub Release creation is **never** gated on the rubygems key (it
+uses `github.token`), so a tokenless tag still yields the source gem + a Release.
+
+To actually publish (reproducing red-candle's behavior):
+
+```yaml
+with:
+  publish: true
+secrets:
+  rubygems-api-key: ${{ secrets.RUBYGEMS_API_KEY }}
+```
+
+---
+
+## Repo name (reusable workflow, not an action)
+
+The repo is **`scientist-labs/rust-gem-release`**. This is unambiguously a **reusable
+workflow** (`on: workflow_call`), **not** a composite/JS/Docker action — its four legs are
+*separate jobs* across two runner OSes (`ubuntu-24.04` + `macos-26`) with `strategy.matrix`,
+`needs` edges, and per-job `permissions`. A composite action runs as steps inside one
+already-allocated job on one runner and cannot declare `runs-on`, fan out a matrix, span
+macOS+Linux, or model `needs`/per-job permissions. The entry file ships as
+`.github/workflows/release.yml`, and the name leaves room for a sibling PR-CI reusable
+workflow (`.github/workflows/build.yml`) in the same repo.
+
+`0.1.0` is the **first release**. Callers pin **`@v0`** — a **moving major tag**, advanced
+as the org rollout hardens the workflow, so an interface-widening reaches all callers at
+once. For reproducibility you may instead pin the **immutable `@0.1.0`** point release (or,
+for supply-chain parity with the SHA-pinned actions inside this workflow, SHA-pin
+`@<sha>`).
+
+---
+
+## Example
+
+A complete, real caller — red-candle's migrated release workflow, with the Metal/Accelerate
+`darwin-verify-cmd`, the `aws-lc-sys` `x86_64-cargo-config`, and `publish: true` — lives at
+[`examples/red-candle-release.yml`](examples/red-candle-release.yml).
