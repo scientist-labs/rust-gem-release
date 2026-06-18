@@ -30,9 +30,17 @@ name: Reusable Rust Gem Release
 #   platform-gem-env    Env var name the gemspec reads to enter its precompiled branch.
 #   darwin-platform     Darwin platform string for the fat gem (default arm64-darwin).
 #   x86_64-cargo-config OPTIONAL .cargo/config.toml text, written on the x86_64-linux leg ONLY.
+#   linux-cargo-config  OPTIONAL .cargo/config.toml text, written on BOTH linux legs (base).
+#   aarch64-cargo-config OPTIONAL .cargo/config.toml text, written on the aarch64-linux leg ONLY.
+#   darwin-pre-build-command OPTIONAL shell run on each darwin leg BEFORE compile (e.g. brew install).
+#   job-timeout-minutes OPTIONAL per-job timeout for the heavy build legs (default 360).
 #   darwin-verify-cmd   OPTIONAL extra shell run per darwin leg, with $BUNDLE exported.
 #   publish             Intent gate for `gem push` (default FALSE).
 #   build-darwin / build-x86_64-linux / build-aarch64-linux  per-leg toggles.
+#   NOTE: the linux cargo-config inputs CANNOT apt-install — cross-gem@v1.4.4 runs the
+#   build in a fixed rb-sys-dock image with no in-container hook. An [env] only helps if
+#   the tool already exists in the image (clang/llvm/cmake/cross-sysroot yes; protoc/
+#   gfortran no). A gem needing an absent linux package must toggle that leg off.
 #
 # SECRETS
 #   rubygems-api-key    OPTIONAL. Mapped into GEM_HOST_API_KEY by every push step.
@@ -120,10 +128,30 @@ on:
         required: false
         default: "arm64-darwin"
       x86_64-cargo-config:
-        description: "OPTIONAL raw .cargo/config.toml text written at repo root on the x86_64-linux leg ONLY, BEFORE cross-gem runs. Empty default => no-op. red-candle sets the aws-lc-sys gcc-95189 workaround. The x86_64-ONLY scoping is HARDCODED."
+        description: "OPTIONAL raw .cargo/config.toml text written at repo root on the x86_64-linux leg ONLY, BEFORE cross-gem runs. Empty default => no-op. red-candle sets the aws-lc-sys gcc-95189 workaround. The x86_64-ONLY scoping is HARDCODED. When ALSO setting linux-cargo-config, this per-leg value OVERWRITES (does not merge with) the base on the x86_64 leg."
         type: string
         required: false
         default: ""
+      linux-cargo-config:
+        description: "OPTIONAL raw .cargo/config.toml text written at repo root on BOTH linux legs (x86_64 AND aarch64), BEFORE cross-gem runs. Empty default => no-op (preserves existing behavior; red-candle leaves it empty). Use for [env] that BOTH legs need (e.g. a uniform BINDGEN_EXTRA_CLANG_ARGS, jobserver/threading flags, or a PROTOC/CC override pointing at a binary the rb-sys-dock image ALREADY ships). The per-leg x86_64-cargo-config / aarch64-cargo-config, when non-empty, OVERWRITE this base on their own leg (last-writer-wins, not a TOML merge — keep all keys for a leg in one input). NOTE: cargo only honors a config.toml [env] whose referenced tools EXIST in the cross container; this input cannot apt-install packages (cross-gem@v1.4.4 exposes no in-container hook)."
+        type: string
+        required: false
+        default: ""
+      aarch64-cargo-config:
+        description: "OPTIONAL raw .cargo/config.toml text written at repo root on the aarch64-linux leg ONLY, BEFORE cross-gem runs (mirror of x86_64-cargo-config for the cross leg). Empty default => no-op. Use for aarch64-cross [env] like CC/CXX/BINDGEN_EXTRA_CLANG_ARGS for a bindgen/C++ consumer (e.g. RocksDB). The rb-sys aarch64 image ALREADY sets LIBCLANG_PATH + BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu=--sysroot=... + the cross toolchain, so this is for AUGMENTING that, not bootstrapping it. OVERWRITES linux-cargo-config on the aarch64 leg when both are set. Cannot install packages absent from the image."
+        type: string
+        required: false
+        default: ""
+      darwin-pre-build-command:
+        description: "OPTIONAL shell run on EACH darwin-build leg BEFORE compile-command (e.g. `brew install protobuf` for a prost/protoc consumer, or extra C-lib deps for a bundled-C gem). Empty default => skip (correct for red-candle and every plain gem). macos-26 ships Homebrew, so this is the supported darwin escape hatch for a native system build dep. The LINUX legs have NO equivalent hook: cross-gem@v1.4.4 runs the build inside a fixed rb-sys-dock image with no in-container apt step, so a linux system package that the image lacks (protoc, gfortran, leptonica/tesseract dev) cannot be installed here — toggle that leg off and ship the source gem for it."
+        type: string
+        required: false
+        default: ""
+      job-timeout-minutes:
+        description: "OPTIONAL per-job timeout (minutes) for the heavy build legs (linux-gems, darwin-build, darwin-package). Default 360 = GitHub's own default, so existing behavior is unchanged. Raise it for a heavy-C++ consumer (RocksDB, MuPDF/Tesseract, from-source OpenBLAS) whose per-ABI compile can approach the limit; lower it to fail a hung build faster. Source-gem and prepare/collect are light and deliberately not gated."
+        type: number
+        required: false
+        default: 360
       darwin-verify-cmd:
         description: "OPTIONAL extra shell run on each darwin-build leg AFTER compile+relocate, with $BUNDLE exported as the relocated bundle. Empty default => skip. The arm64 file-check ALWAYS runs and stays HARDCODED; only this framework grep is gem-specific."
         type: string
@@ -338,6 +366,7 @@ jobs:
             # host-triple lookup (KeyError aarch64-unknown-linux-musl).
             runs-on: ubuntu-24.04
     runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: ${{ inputs.job-timeout-minutes }}
     steps:
       - name: Decide whether this leg is enabled
         id: leg
@@ -357,19 +386,39 @@ jobs:
         if: steps.leg.outputs.enabled == 'true'
         with:
           ruby-version: "3.4"
-      # OPTIONAL x86_64-ONLY cargo config (e.g. red-candle's aws-lc-sys gcc-95189
-      # workaround). cross-gem@v1.4.4 has no env input but bind-mounts the repo,
-      # so a .cargo/config.toml [env] at the repo root is read by cargo. Scoped to
-      # x86_64 only: the gcc panic is host==target specific, so aarch64-cross /
-      # darwin / source must never receive it. No-op when the input is empty.
-      - name: Write x86_64 cargo config (x86_64 leg only, when input non-empty)
-        if: ${{ steps.leg.outputs.enabled == 'true' && matrix.platform == 'x86_64-linux' && inputs.x86_64-cargo-config != '' }}
+      # OPTIONAL cargo config written to .cargo/config.toml at the repo root BEFORE
+      # cross-gem runs. cross-gem@v1.4.4 has no env input but bind-mounts the repo,
+      # so cargo inside the container reads this [env]. Layering (last-writer-wins,
+      # NOT a TOML merge — two [env] tables in one file is invalid):
+      #   1. linux-cargo-config  -> base, written on BOTH legs.
+      #   2. x86_64-cargo-config -> x86_64 leg only, OVERWRITES the base there.
+      #   3. aarch64-cargo-config-> aarch64 leg only, OVERWRITES the base there.
+      # For red-candle (only x86_64-cargo-config set): the x86_64 leg writes EXACTLY
+      # that text and the aarch64 leg writes nothing — byte-identical to before. The
+      # x86_64-only scoping of the aws-lc-sys gcc-95189 workaround is thus preserved.
+      # This input cannot apt-install: it only helps when the [env] points at tools
+      # the rb-sys-dock image already ships (clang/llvm/cmake/cross-sysroot — yes;
+      # protoc/gfortran — no).
+      - name: Write cargo config (base + per-leg override, when any input non-empty)
+        if: ${{ steps.leg.outputs.enabled == 'true' && (inputs.linux-cargo-config != '' || inputs.x86_64-cargo-config != '' || inputs.aarch64-cargo-config != '') }}
         env:
-          CARGO_CONFIG: ${{ inputs.x86_64-cargo-config }}
+          PLATFORM: ${{ matrix.platform }}
+          LINUX_CARGO_CONFIG: ${{ inputs.linux-cargo-config }}
+          X86_64_CARGO_CONFIG: ${{ inputs.x86_64-cargo-config }}
+          AARCH64_CARGO_CONFIG: ${{ inputs.aarch64-cargo-config }}
         run: |
+          # Pick the per-leg override; fall back to the base. The empty-string
+          # default means an unset per-leg input leaves the base in place.
+          CONFIG="$LINUX_CARGO_CONFIG"
+          if [ "$PLATFORM" = "x86_64-linux" ]  && [ -n "$X86_64_CARGO_CONFIG"  ]; then CONFIG="$X86_64_CARGO_CONFIG";  fi
+          if [ "$PLATFORM" = "aarch64-linux" ] && [ -n "$AARCH64_CARGO_CONFIG" ]; then CONFIG="$AARCH64_CARGO_CONFIG"; fi
+          if [ -z "$CONFIG" ]; then
+            echo "No cargo config applies to $PLATFORM (base empty, no per-leg override); skipping write."
+            exit 0
+          fi
           mkdir -p .cargo
-          printf '%s' "$CARGO_CONFIG" > .cargo/config.toml
-          echo "Wrote .cargo/config.toml:"
+          printf '%s' "$CONFIG" > .cargo/config.toml
+          echo "Wrote .cargo/config.toml for $PLATFORM:"
           cat .cargo/config.toml
       - uses: oxidize-rb/actions/cross-gem@e5f9a49a7812a078584072f6e3f657ad247c8771 # v1.4.4
         if: steps.leg.outputs.enabled == 'true'
@@ -431,6 +480,7 @@ jobs:
       matrix:
         ruby: ${{ fromJSON(needs.prepare.outputs.ruby-json) }}
     runs-on: macos-26
+    timeout-minutes: ${{ inputs.job-timeout-minutes }}
     permissions:
       contents: read
     steps:
@@ -440,6 +490,20 @@ jobs:
           ruby-version: ${{ matrix.ruby }}
           rustup-toolchain: stable
           bundler-cache: true
+      # OPTIONAL native system-dep install BEFORE compile (darwin only). macos-26
+      # ships Homebrew, so a prost/protoc or bundled-C consumer can `brew install`
+      # here. Empty default => skip (red-candle and every plain gem). The linux legs
+      # have no analogue — the rb-sys-dock image is fixed and cross-gem@v1.4.4 has
+      # no in-container install step.
+      - name: Darwin pre-build system deps (when input non-empty)
+        if: ${{ inputs.darwin-pre-build-command != '' }}
+        env:
+          DARWIN_PRE_BUILD_COMMAND: ${{ inputs.darwin-pre-build-command }}
+        run: |
+          echo "Running darwin-pre-build-command before compile:"
+          echo "  $DARWIN_PRE_BUILD_COMMAND"
+          eval "$DARWIN_PRE_BUILD_COMMAND" \
+            || { echo "::error::darwin-pre-build-command failed (exit $?). Check the command and its quoting."; exit 1; }
       - name: Compile native extension
         run: ${{ inputs.compile-command }}
       - name: Relocate bundle into Ruby-ABI subdir
@@ -482,6 +546,7 @@ jobs:
     needs: [prepare, source-gem, darwin-build]
     if: ${{ inputs.build-darwin && !cancelled() && needs.source-gem.result == 'success' && (needs.darwin-build.result == 'success' || needs.darwin-build.result == 'skipped') }}
     runs-on: macos-26
+    timeout-minutes: ${{ inputs.job-timeout-minutes }}
     permissions:
       contents: write
     steps:

@@ -84,7 +84,11 @@ That's it for a gem where `gem-name == gemspec basename == extension dir` (true 
 | `compile-command` | string | no | `bundle exec rake compile` | Native macOS compile entrypoint on `darwin-build` (one `.bundle` per ABI) — the rake-compiler/rb_sys common case. Override only for a different build entrypoint. The **linux legs do not use this** (cross-gem owns the linux build invocation). Runner labels are deliberately not exposed. |
 | `platform-gem-env` | string | no | `RUST_GEM_PLATFORM` | Name of the env var the consumer's gemspec reads to enter its precompiled-platform branch (set `spec.platform`, clear `spec.extensions`, pack the bundles). `darwin-package` exports `ENV[<this>]=<darwin-platform>` before `gem build`. red-candle's gemspec reads `RED_CANDLE_PLATFORM_GEM`, so red-candle **must override** to that; **new adopters write their gemspec branch to read the generic default** `RUST_GEM_PLATFORM` and pass nothing. Inert until the consumer adds the gemspec branch ([prerequisite #2](#consumer-prerequisites)). |
 | `darwin-platform` | string | no | `arm64-darwin` | Darwin platform string for the fat gem and its push/attach/verify globs. **Never intel darwin** — the generic `arm64-darwin` is what serves every `arm64-darwin-NN` user (RubyGems does not fall back across darwin majors). Exposed only so a hypothetical future target could differ; `arm64-darwin` is the only value red-candle ships. |
-| `x86_64-cargo-config` | string | no | `""` (no-op) | **Optional** raw `.cargo/config.toml` text written at the repo root on the **`x86_64-linux` leg only**, *before* cross-gem runs (cross-gem bind-mounts the repo, so cargo reads it). Empty default makes the write a no-op (correct for every surveyed consumer). red-candle sets the `aws-lc-sys` gcc-95189 workaround `[env]\nAWS_LC_SYS_CMAKE_BUILDER = "1"`. The x86_64-only scoping is **hardcoded** (the gcc panic is host==target specific); only the config *text* is the input. |
+| `x86_64-cargo-config` | string | no | `""` (no-op) | **Optional** raw `.cargo/config.toml` text written at the repo root on the **`x86_64-linux` leg only**, *before* cross-gem runs (cross-gem bind-mounts the repo, so cargo reads it). Empty default makes the write a no-op (correct for every surveyed consumer). red-candle sets the `aws-lc-sys` gcc-95189 workaround `[env]\nAWS_LC_SYS_CMAKE_BUILDER = "1"`. The x86_64-only scoping is **hardcoded** (the gcc panic is host==target specific); only the config *text* is the input. When `linux-cargo-config` is also set, this **overwrites** the base on the x86_64 leg (last-writer-wins, not a TOML merge). |
+| `linux-cargo-config` | string | no | `""` (no-op) | **Optional** raw `.cargo/config.toml` text written on **both** linux legs (x86_64 **and** aarch64) before cross-gem. The base layer for `[env]` both legs need (uniform `BINDGEN_EXTRA_CLANG_ARGS`, jobserver flags, a `PROTOC`/`CC` override pointing at a binary the rb-sys-dock image **already ships**). The per-leg `x86_64-cargo-config` / `aarch64-cargo-config` **overwrite** this on their own leg. **Cannot apt-install** — cross-gem@v1.4.4 runs the build inside a fixed rb-sys-dock image with no in-container install hook, so an `[env]` is only useful when its referenced tools are present (clang/llvm/cmake/cross-sysroot **yes**; protoc/gfortran **no**). |
+| `aarch64-cargo-config` | string | no | `""` (no-op) | **Optional** raw `.cargo/config.toml` text written on the **`aarch64-linux` leg only** (mirror of `x86_64-cargo-config` for the cross leg). For aarch64-cross `[env]` such as `CC`/`CXX`/`BINDGEN_EXTRA_CLANG_ARGS` for a bindgen/C++ consumer (RocksDB). The rb-sys aarch64 image **already** sets `LIBCLANG_PATH`, `BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu=--sysroot=…`, and the cross toolchain — so this **augments**, it does not bootstrap. Overwrites `linux-cargo-config` on the aarch64 leg. Same no-apt limitation. |
+| `darwin-pre-build-command` | string | no | `""` (skip) | **Optional** shell run on each `darwin-build` leg **before** `compile-command`. `macos-26` ships Homebrew, so a prost/protoc (`brew install protobuf`) or bundled-C consumer installs its native system dep here. Empty default skips it. **Darwin only** — the linux legs have no analogue (fixed rb-sys-dock image, no in-container install in cross-gem@v1.4.4); a linux system package the image lacks means toggling that leg off and shipping the source gem for it. |
+| `job-timeout-minutes` | number | no | `360` | **Optional** per-job timeout for the heavy build legs (`linux-gems`, `darwin-build`, `darwin-package`). Default `360` = GitHub's own default, so existing runs are unchanged. Raise it for a heavy-C++ consumer (RocksDB, MuPDF/Tesseract, from-source OpenBLAS) whose per-ABI compile can approach the limit; lower it to fail a hung build faster. `prepare`/`source-gem`/`collect` are light and not gated. |
 | `darwin-verify-cmd` | string | no | `""` (skip) | **Optional** extra shell run on each `darwin-build` leg after compile+relocate, with `$BUNDLE` exported as the freshly-relocated `lib/<ext-name>/<minor>/<ext-name>.bundle`. Empty default skips it (correct for plain CPU-only gems). red-candle asserts framework linkage via `otool -L "$BUNDLE" \| grep -Eiq '(Metal\|Accelerate)\.framework'`. The arm64 architecture check (`file "$BUNDLE" \| grep -q arm64`) **always runs and is hardcoded** — only the framework grep is gem-specific. |
 | `publish` | boolean | no | `false` | **Intent gate** for `gem push`. Lives in `inputs` (not `secrets`) so it is legal in step `if:` and bash guards. **Default `false`** per the safety mandate: a tag still builds all gems, runs `gem build`, and creates/attaches the GitHub Release, but **skips the RubyGems push**, emitting a loud `::notice::`. Set `true` **and** supply the secret to actually publish. |
 | `build-darwin` | boolean | no | `true` | Toggle the native `arm64-darwin` legs (`darwin-build` + `darwin-package`) together, via job-level `if: inputs.build-darwin` on both. Off ⇒ a token-less or Linux-only gem still ships source + the two linux platforms. The native `macos-26` path is hardcoded (the Docker/osxcross cross path yields CPU-only darwin). |
@@ -204,6 +208,35 @@ don't rediscover them:
 > be published, but the darwin gem won't assemble until you re-run. The whole release is
 > idempotent (idempotent push + `--clobber` attach), so a re-run after fixing the ABI
 > simply fills in the darwin gem.
+
+---
+
+## Gems with system build dependencies
+
+The precompiled **linux** legs build inside a **fixed `rb-sys-dock` image** via the
+SHA-pinned `oxidize-rb/cross-gem@v1.4.4`, which exposes **no in-container install hook**
+(no `pre-script`, no `apt-packages`). That image **already ships** `clang`/`llvm-12` +
+`LIBCLANG_PATH`, `cmake` (`CMAKE_<triple>`), and the cross sysroot
+(`BINDGEN_EXTRA_CLANG_ARGS_<triple>=--sysroot=…`). So:
+
+- **bindgen / C++-from-clang gems (e.g. RocksDB / `indradb-ruby`)** work on both legs;
+  augment the cross env with `aarch64-cargo-config` / `linux-cargo-config` (`[env]` for
+  `CC`/`CXX`/extra `BINDGEN_EXTRA_CLANG_ARGS`) since the underlying tools are present.
+- **gems needing a package the image lacks** — `protoc` (`lancelot`/`lance`), `gfortran`
+  (from-source OpenBLAS / `clusterkit`), Tesseract/Leptonica/MuPDF dev (`parsekit`) —
+  **cannot** be served by the precompiled linux legs through this workflow: a
+  `.cargo/config.toml` `[env]` can only point at a binary that exists, and there is no
+  apt step to add one. For these, set `build-x86_64-linux: false` and
+  `build-aarch64-linux: false` and ship **source + (where it builds) darwin**; linux
+  users fall through to the source gem (which compiles the dep on install).
+- On **darwin**, `darwin-pre-build-command` (`brew install …`) **does** let a native leg
+  install a system dep before compile (macos-26 has Homebrew). That is the one
+  per-platform install escape hatch; it has no linux equivalent under the pinned
+  cross-gem.
+
+Lifting the linux limitation needs a **cross-gem bump to a version with a pre-build/
+in-container step** (or a custom rb-sys-dock image with the deps baked in) — a pin change,
+deliberately **not** done here.
 
 ---
 
