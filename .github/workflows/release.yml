@@ -18,6 +18,18 @@ name: Reusable Rust Gem Release
 # Each fat gem carries one compiled extension per Ruby ABI in ruby-versions, so
 # consumers install with no Rust toolchain.
 #
+# TWO EVENT PATHS (branched on github.event_name, threaded from the caller):
+#   - push (a version TAG): the REAL release. prepare guards tag == version-command,
+#     every leg builds, the source gem creates the GitHub Release, and (with
+#     publish:true + a key) all gems push to RubyGems.
+#   - workflow_dispatch (caller exposes a `publish` boolean, default false): a
+#     full-matrix DRY-RUN off a BRANCH. prepare takes `version` straight from
+#     version-command (NO tag guard — GITHUB_REF_NAME is the branch, not a version),
+#     every leg still BUILDS (the point: validate gem build + cross-gem + fat-gem
+#     assembly), but the GitHub Release + every "Attach to Release" step are gated to
+#     `github.event_name == 'push'` so a branch run never creates/clobbers a Release,
+#     and publish defaults false so nothing pushes to RubyGems. See README "Publishing".
+#
 # -----------------------------------------------------------------------------
 # INPUTS (see each input's `description:` below for the full contract)
 #   gem-name            (REQUIRED) RubyGems package name; drives every push/attach glob.
@@ -35,7 +47,8 @@ name: Reusable Rust Gem Release
 #   darwin-pre-build-command OPTIONAL shell run on each darwin leg BEFORE compile (e.g. brew install).
 #   job-timeout-minutes OPTIONAL per-job timeout for the heavy build legs (default 360).
 #   darwin-verify-cmd   OPTIONAL extra shell run per darwin leg, with $BUNDLE exported.
-#   publish             Intent gate for `gem push` (default FALSE).
+#   publish             Intent gate for `gem push` (default FALSE). A caller threads
+#                       this from a workflow_dispatch boolean to drive dry-runs.
 #   build-darwin / build-x86_64-linux / build-aarch64-linux  per-leg toggles.
 #   NOTE: the linux cargo-config inputs CANNOT apt-install — cross-gem@v1.4.4 runs the
 #   build in a fixed rb-sys-dock image with no in-container hook. An [env] only helps if
@@ -158,7 +171,7 @@ on:
         required: false
         default: ""
       publish:
-        description: "INTENT gate for `gem push` (lives in inputs so it is legal in `if:`/bash). DEFAULT FALSE: a tag still builds all gems, runs `gem build`, and creates/attaches the GitHub Release, but skips RubyGems push. Set true AND supply the secret to actually publish."
+        description: "INTENT gate for `gem push` (lives in inputs so it is legal in `if:`/bash). DEFAULT FALSE: a tag still builds all gems, runs `gem build`, and creates/attaches the GitHub Release, but skips RubyGems push. Set true AND supply the secret to actually publish. A caller threads this from its own `workflow_dispatch` boolean (default false) to drive a full-matrix DRY-RUN: on a dispatch run every leg builds but the GitHub Release + every attach step are skipped (gated on `github.event_name == 'push'`), so a dry-run never touches RubyGems OR a Release."
         type: boolean
         required: false
         default: false
@@ -195,7 +208,7 @@ on:
         description: "The resolved gemspec filename actually built."
         value: ${{ jobs.prepare.outputs.gemspec }}
       release-url:
-        description: "URL of the GitHub Release created/updated."
+        description: "URL of the GitHub Release created/updated. Empty on a workflow_dispatch dry-run (the Release step is push-only)."
         value: ${{ jobs.source-gem.outputs.release-url }}
       published:
         description: "'true' only if the source gem was actually pushed to RubyGems (publish=true AND token present AND not an idempotent repush-skip)."
@@ -243,23 +256,38 @@ jobs:
           echo "ext-name=$ext" >> "$GITHUB_OUTPUT"
           echo "gemspec=$gemspec" >> "$GITHUB_OUTPUT"
           echo "Resolved ext-name=$ext gemspec=$gemspec"
-      - name: Guard tag == version, compute prerelease
+      # On a TAG push this guards GITHUB_REF_NAME (v-stripped) == version-command and
+      # is byte-identical to 0.2.0. On a workflow_dispatch DRY-RUN off a branch,
+      # GITHUB_REF_NAME is the BRANCH (not a version), so we SKIP the guard and take
+      # `version` straight from version-command (the gem's real version) — that real
+      # value is what downstream jobs (darwin-package fat-gem verify, collect) need to
+      # build with. prerelease? is computed from the resolved version either way.
+      - name: Resolve version + prerelease (tag guard on push; version-command on dispatch)
         id: v
         env:
+          EVENT_NAME: ${{ github.event_name }}
           VERSION_COMMAND: ${{ inputs.version-command }}
           GEM_NAME: ${{ inputs.gem-name }}
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
           FILE_VER="$(eval "$VERSION_COMMAND")" \
             || { echo "::error::version-command failed to run; check the override quoting (got: $VERSION_COMMAND)"; exit 1; }
-          if [ "$TAG" != "$FILE_VER" ]; then
-            echo "::error::tag '$TAG' != version-command output ('$FILE_VER'). Bump the version before tagging."
-            exit 1
+          if [ "$EVENT_NAME" = "push" ]; then
+            TAG="${GITHUB_REF_NAME#v}"
+            if [ "$TAG" != "$FILE_VER" ]; then
+              echo "::error::tag '$TAG' != version-command output ('$FILE_VER'). Bump the version before tagging."
+              exit 1
+            fi
+            VERSION="$TAG"
+          else
+            # workflow_dispatch (or any non-tag event): no tag to guard against —
+            # GITHUB_REF_NAME is the branch. The version-command output IS the version.
+            VERSION="$FILE_VER"
+            echo "::notice::${EVENT_NAME} run — DRY-RUN: building version ${VERSION} from version-command (no tag guard, no Release, no RubyGems push unless publish:true)."
           fi
-          PRE="$(ruby -rrubygems -e 'print Gem::Version.new(ARGV[0]).prerelease?' "$TAG")"
-          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+          PRE="$(ruby -rrubygems -e 'print Gem::Version.new(ARGV[0]).prerelease?' "$VERSION")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "prerelease=$PRE" >> "$GITHUB_OUTPUT"
-          echo "Releasing ${GEM_NAME} $TAG (prerelease=$PRE)"
+          echo "Releasing ${GEM_NAME} $VERSION (prerelease=$PRE, event=${EVENT_NAME})"
       - name: Derive Ruby-version forms (JSON array + space-list) from the CSV
         id: rubies
         env:
@@ -274,7 +302,9 @@ jobs:
   # ---------------------------------------------------------------------------
   # Source gem (platform "ruby"). Pushed first and creates the GitHub Release, so
   # a tag always yields at least an installable gem even if a native leg flakes.
-  # MANDATORY — no toggle. Release creation uses github.token, never the rubygems key.
+  # MANDATORY — no toggle. Release creation uses github.token, never the rubygems key,
+  # and is gated to event_name == 'push' (a workflow_dispatch dry-run still BUILDS the
+  # source gem — validating `gem build` — but creates no Release).
   # ---------------------------------------------------------------------------
   source-gem:
     needs: prepare
@@ -324,8 +354,14 @@ jobs:
             pushed=true
           done
           echo "published=$pushed" >> "$GITHUB_OUTPUT"
+      # PUSH-ONLY. A workflow_dispatch dry-run runs off a BRANCH, where
+      # GITHUB_REF_NAME is the branch name — creating a Release here would mint/
+      # clobber a junk Release named after the branch. Gating on event_name keeps
+      # the dry-run to a pure build. release-url then resolves empty on dispatch
+      # (fine — the output is documented as the Release URL, which there isn't one).
       - name: Create GitHub Release
         id: release
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           GEM_NAME: ${{ inputs.gem-name }}
@@ -459,8 +495,11 @@ jobs:
       # `|| true` makes a Release-asset upload failure NON-FATAL by design: the
       # gem is already on RubyGems (the source of truth); the Release asset is a
       # convenience mirror, so a transient upload glitch must not fail the run.
+      # PUSH-ONLY: on a workflow_dispatch dry-run the gem still BUILDS above (the
+      # point — validating cross-gem + fat-gem assembly) but there is no Release to
+      # attach to (source-gem skipped Release creation off a branch).
       - name: Attach to GitHub Release
-        if: steps.leg.outputs.enabled == 'true'
+        if: ${{ steps.leg.outputs.enabled == 'true' && github.event_name == 'push' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$GITHUB_REF_NAME" ${{ steps.cross-gem.outputs.gem-path }} --clobber || true
@@ -618,7 +657,11 @@ jobs:
           done
       # `|| true` makes a Release-asset upload failure NON-FATAL by design (the
       # gem is already on RubyGems; the Release asset is a convenience mirror).
+      # PUSH-ONLY: a workflow_dispatch dry-run still BUILDS + verifies the fat gem
+      # above (the point — validating per-ABI assembly) but there is no Release to
+      # attach to (source-gem skipped Release creation off a branch).
       - name: Attach to GitHub Release
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
           GEM_NAME: ${{ inputs.gem-name }}

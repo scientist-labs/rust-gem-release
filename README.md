@@ -19,7 +19,11 @@ every tag, plus a **source gem** as the universal fallthrough:
 | source (`ruby`) | `gem build` on `ubuntu-24.04`, pushed **first**, **creates the GitHub Release** | any ABI/platform outside the matrix (compiles Rust on install) |
 
 Publishing to RubyGems is **off by default** and a clean no-op without a token — a new
-gem can dry-run the entire 4-target matrix before it owns a RubyGems API key.
+gem can dry-run the entire 4-target matrix before it owns a RubyGems API key. A caller
+can also expose a **`workflow_dispatch`** trigger (with a `publish` boolean, default
+false) to run that full-matrix **dry-run on demand from a branch** — every leg builds,
+but no GitHub Release is created and nothing is pushed (see
+[Publishing](#publishing)).
 
 The canonical consumer is **[red-candle](https://github.com/scientist-labs/red-candle)**
 (`red-candle` 1.8.0 shipped all four platforms from this workflow). Its full caller lives
@@ -51,7 +55,7 @@ jobs:
     with:
       gem-name: parsekit
       version-command: ruby -r./lib/parsekit/version -e 'print Parsekit::VERSION'
-      publish: true                # omit or set false to dry-run (build + Release, no RubyGems push)
+      publish: true                # false (or a workflow_dispatch dry-run) = build only, no RubyGems push; see Publishing
     secrets:
       rubygems-api-key: ${{ secrets.RUBYGEMS_API_KEY }}
 ```
@@ -90,7 +94,7 @@ That's it for a gem where `gem-name == gemspec basename == extension dir` (true 
 | `darwin-pre-build-command` | string | no | `""` (skip) | **Optional** shell run on each `darwin-build` leg **before** `compile-command`. `macos-26` ships Homebrew, so a prost/protoc (`brew install protobuf`) or bundled-C consumer installs its native system dep here. Empty default skips it. **Darwin only** — the linux legs have no analogue (fixed rb-sys-dock image, no in-container install in cross-gem@v1.4.4); a linux system package the image lacks means toggling that leg off and shipping the source gem for it. |
 | `job-timeout-minutes` | number | no | `360` | **Optional** per-job timeout for the heavy build legs (`linux-gems`, `darwin-build`, `darwin-package`). Default `360` = GitHub's own default, so existing runs are unchanged. Raise it for a heavy-C++ consumer (RocksDB, MuPDF/Tesseract, from-source OpenBLAS) whose per-ABI compile can approach the limit; lower it to fail a hung build faster. `prepare`/`source-gem`/`collect` are light and not gated. |
 | `darwin-verify-cmd` | string | no | `""` (skip) | **Optional** extra shell run on each `darwin-build` leg after compile+relocate, with `$BUNDLE` exported as the freshly-relocated `lib/<ext-name>/<minor>/<ext-name>.bundle`. Empty default skips it (correct for plain CPU-only gems). red-candle asserts framework linkage via `otool -L "$BUNDLE" \| grep -Eiq '(Metal\|Accelerate)\.framework'`. The arm64 architecture check (`file "$BUNDLE" \| grep -q arm64`) **always runs and is hardcoded** — only the framework grep is gem-specific. |
-| `publish` | boolean | no | `false` | **Intent gate** for `gem push`. Lives in `inputs` (not `secrets`) so it is legal in step `if:` and bash guards. **Default `false`** per the safety mandate: a tag still builds all gems, runs `gem build`, and creates/attaches the GitHub Release, but **skips the RubyGems push**, emitting a loud `::notice::`. Set `true` **and** supply the secret to actually publish. |
+| `publish` | boolean | no | `false` | **Intent gate** for `gem push`. Lives in `inputs` (not `secrets`) so it is legal in step `if:` and bash guards. **Default `false`** per the safety mandate: a tag still builds all gems, runs `gem build`, and creates/attaches the GitHub Release, but **skips the RubyGems push**, emitting a loud `::notice::`. Set `true` **and** supply the secret to actually publish. A caller threads this from its own `workflow_dispatch` boolean to drive an on-demand **dry-run** (every leg builds; the Release + attach steps are skipped on any non-`push` event) — see [Publishing](#publishing). |
 | `build-darwin` | boolean | no | `true` | Toggle the native `arm64-darwin` legs (`darwin-build` + `darwin-package`) together, via job-level `if: inputs.build-darwin` on both. Off ⇒ a token-less or Linux-only gem still ships source + the two linux platforms. The native `macos-26` path is hardcoded (the Docker/osxcross cross path yields CPU-only darwin). |
 | `build-x86_64-linux` | boolean | no | `true` | Toggle the `x86_64-linux` precompiled leg, via a per-step guard inside the `linux-gems` matrix (you cannot job-`if` a single matrix include). Off ⇒ amd64 users fall through to the source gem. `fail-fast: false` keeps one leg's flake from cancelling the other. |
 | `build-aarch64-linux` | boolean | no | `true` | Toggle the `aarch64-linux` (cross-compiled on the `x86_64` host) leg, same per-step-guard mechanism. Off ⇒ arm64-linux users fall through to the source gem. The cross-on-x86_64 topology is **hardcoded** (a native arm runner trips cross-gem v1.4.4's `cargo-binstall` `KeyError aarch64-unknown-linux-musl`). |
@@ -270,6 +274,46 @@ with:
 secrets:
   rubygems-api-key: ${{ secrets.RUBYGEMS_API_KEY }}
 ```
+
+### Two event paths: tag push (real release) vs `workflow_dispatch` (dry-run)
+
+The workflow branches on `github.event_name`, so the same reusable workflow serves both
+the real release and a maintainer-triggered dry-run:
+
+| | **`push` (a version tag)** | **`workflow_dispatch` (a branch)** |
+| --- | --- | --- |
+| `prepare` version | `GITHUB_REF_NAME` (v-stripped), **guarded** `== version-command` | taken **straight from `version-command`** (no tag guard — `GITHUB_REF_NAME` is the branch, not a version) |
+| All four build legs | build | **build** (validate `gem build` + cross-gem + fat-gem assembly) |
+| GitHub Release + every "Attach to Release" step | created/updated | **skipped** (gated `github.event_name == 'push'`) — no junk Release named after the branch |
+| RubyGems push | per the `publish` triad above | per the `publish` triad (callers default `publish: false`, so **none**) |
+
+A `workflow_dispatch` run is therefore a **full-matrix DRY-RUN**: every leg builds, but
+it touches **neither RubyGems nor a GitHub Release**. To wire it, the caller adds the
+trigger and a `publish` boolean (default `false`) it threads into `with.publish`:
+
+```yaml
+on:
+  push: { tags: [ "[0-9]+.[0-9]+.[0-9]+", "v[0-9]+.[0-9]+.[0-9]+" ] }
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Push to RubyGems (leave false for a dry-run)"
+        type: boolean
+        default: false
+
+jobs:
+  release:
+    permissions: { contents: write }
+    uses: scientist-labs/rust-gem-release/.github/workflows/release.yml@v0
+    with:
+      # tag push -> the input is unset -> the workflow default (false) applies;
+      # dispatch -> the maintainer's choice flows through.
+      publish: ${{ github.event_name == 'push' || inputs.publish }}
+      # ...gem-name, version-command, etc.
+```
+
+The tag-push path is **unchanged** — byte-identical to the always-publish release of
+prior versions.
 
 ---
 
