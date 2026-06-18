@@ -1,0 +1,133 @@
+name: build-cross-images
+
+# =============================================================================
+# Build the DEPS-ENRICHED rb-sys cross-compile images that consumer gems with
+# heavy linux system build-deps (lancelot/clusterkit/parsekit) pre-seed onto the
+# runner's Docker daemon so that oxidize-rb cross-gem -> rb-sys-dock uses OUR
+# image instead of the stock rbsys/<platform>:0.9.128 it would otherwise pull.
+#
+# WHY THIS EXISTS
+#   cross-gem@v1.4.4 runs `rb-sys-dock --platform <p> --build`, which downloads
+#   "rbsys/<platform>:0.9.128" (the :tag == the rb_sys GEM version each gem
+#   resolves). That stock image lacks protoc / gfortran / OpenBLAS / leptonica /
+#   tesseract dev libs, and cross-gem exposes NO in-container apt hook. The robust
+#   fix (no cross-gem fork): build an image FROM rbsys/<platform>:0.9.128 with the
+#   extra apt packages ADDED, publish it to GHCR, and have the consumer release
+#   workflow do, BEFORE the cross-gem step:
+#       docker pull ghcr.io/scientist-labs/rust-gem-cross:<platform>
+#       docker tag  ghcr.io/scientist-labs/rust-gem-cross:<platform> rbsys/<platform>:0.9.128
+#   rb-sys-dock then finds rbsys/<platform>:0.9.128 already present locally
+#   (`docker images -q` hit) and SKIPS its pull, building against our enriched
+#   image. The 0.9.128 :tag is the load-bearing contract — it must match the
+#   rb_sys version each gem resolves (pin each gem's Cargo.lock to rb-sys 0.9.128).
+#
+# The custom image is FROM rbsys/<platform>:0.9.128 so the ENTIRE rb-sys cross
+# toolchain is preserved (RUBY_CC_VERSION, the cross sysroot + libc6-*-cross,
+# BINDGEN_EXTRA_CLANG_ARGS_*, clang/llvm-12, cmake, pkg-config, rustup/cargo); we
+# only ADD apt packages. The rb-sys base is itself FROM rake-compiler-dock
+# (ubuntu:20.04 Focal), so the apt names below are Focal names and an
+# `apt-get update` is required first.
+#
+# UNION apt deps serving all three gems (idempotent; some may already be present
+# in the rcd base — relisting is harmless):
+#   protobuf-compiler   lancelot: lance -> prost-build needs a system protoc on PATH
+#   gfortran            clusterkit: OpenBLAS link/build Fortran ABI (safety net)
+#   libopenblas-dev     clusterkit: openblas-system links the SYSTEM BLAS
+#   liblapack-dev       clusterkit: LAPACK for ndarray-linalg
+#   libleptonica-dev    parsekit: forward-compat for a future system-tesseract path
+#   libtesseract-dev    parsekit: ditto (tesseract-rs 0.2 bundled build ignores it today)
+#   tesseract-ocr       parsekit: ditto
+#
+# PUBLISH / VISIBILITY
+#   The push MUST run inside Actions with the in-workflow GITHUB_TOKEN and
+#   permissions: packages: write (the local xrl token has no write:packages). The
+#   package must be PUBLIC so consumer-repo runners can `docker pull` with no auth
+#   — set the scientist-labs org default package visibility to Public (or flip it
+#   once in the package UI). The LABEL below links the package to this repo for
+#   the package page + inherited repo permissions.
+#
+# ARCH TOPOLOGY (deliberate, see the README "Gems with system build deps"):
+#   x86_64 image builds on ubuntu-24.04; aarch64 image builds NATIVELY on
+#   ubuntu-24.04-arm (free for public repos) to avoid QEMU. NOTE the rb-sys
+#   aarch64 image is an x86_64 image carrying an aarch64 cross-SYSROOT, and
+#   cross-gem itself runs the aarch64 leg on an x86_64 host. So a plain
+#   `apt-get install lib*-dev` here installs the build-arch libs into `/`, which
+#   serve HOST build-tools (protoc) but are NOT in the cross sysroot the aarch64
+#   LINK step uses. protoc (lancelot) is a host build-tool -> works cross. The
+#   target-lib deps (OpenBLAS/leptonica) only matter once those gems' aarch64
+#   legs are enabled; until then lancelot ships both arches and clusterkit/
+#   parsekit ship x86_64 + source for aarch64.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-cross-images.yml"
+      - "docker/Dockerfile.cross"
+
+env:
+  IMAGE_REPO: ghcr.io/scientist-labs/rust-gem-cross
+  RBSYS_TAG: "0.9.128"
+
+jobs:
+  build:
+    name: build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runs-on }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86_64-linux
+            runs-on: ubuntu-24.04
+          - platform: aarch64-linux
+            # Build the aarch64 image NATIVELY on a free public ARM runner to
+            # avoid QEMU. (The rb-sys aarch64 cross image is consumed on an
+            # x86_64 host by cross-gem; this only governs where the IMAGE LAYER
+            # apt step runs — host build-tools like protoc cross fine.)
+            runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_USER: ${{ github.actor }}
+        run: echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      - name: Build deps-enriched cross image
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --build-arg "PLATFORM=${PLATFORM}" \
+            --build-arg "RBSYS_TAG=${RBSYS_TAG}" \
+            --tag "${IMAGE_REPO}:${PLATFORM}" \
+            --tag "${IMAGE_REPO}:${PLATFORM}-${RBSYS_TAG}" \
+            --file docker/Dockerfile.cross \
+            docker
+
+      - name: Push image (both tags)
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          docker push "${IMAGE_REPO}:${PLATFORM}"
+          docker push "${IMAGE_REPO}:${PLATFORM}-${RBSYS_TAG}"
+
+      # No REST endpoint flips a GHCR package to public, so visibility is governed
+      # by the scientist-labs org DEFAULT package visibility (set to Public) or a
+      # one-time manual flip in the package settings. This step is a deliberate
+      # no-op that documents the requirement and surfaces the package URL; it must
+      # tolerate "already public" / the absence of a flip API.
+      - name: Note public-visibility requirement
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          echo "::notice::Pushed ${IMAGE_REPO}:${PLATFORM} (+ :${PLATFORM}-${RBSYS_TAG})."
+          echo "::notice::Ensure scientist-labs org default package visibility is Public (or flip rust-gem-cross to Public once in the package UI) so consumer runners can pull without auth."

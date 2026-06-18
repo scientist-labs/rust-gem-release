@@ -45,6 +45,11 @@ name: Reusable Rust Gem Release
 #   linux-cargo-config  OPTIONAL .cargo/config.toml text, written on BOTH linux legs (base).
 #   aarch64-cargo-config OPTIONAL .cargo/config.toml text, written on the aarch64-linux leg ONLY.
 #   darwin-pre-build-command OPTIONAL shell run on each darwin leg BEFORE compile (e.g. brew install).
+#   linux-cross-image-repo OPTIONAL GHCR repo of a deps-enriched rb-sys cross image to pre-seed
+#                       onto the runner (docker pull + docker tag rbsys/<platform>:<tag>) so
+#                       rb-sys-dock builds against it. Empty -> no-op. The LINUX system-dep hook.
+#   linux-cross-image-tag rb-sys :tag the pre-seed re-tags to (default 0.9.128); must == each gem's
+#                       resolved rb_sys version. Only used when linux-cross-image-repo is set.
 #   job-timeout-minutes OPTIONAL per-job timeout for the heavy build legs (default 360).
 #   darwin-verify-cmd   OPTIONAL extra shell run per darwin leg, with $BUNDLE exported.
 #   publish             Intent gate for `gem push` (default FALSE). A caller threads
@@ -53,7 +58,8 @@ name: Reusable Rust Gem Release
 #   NOTE: the linux cargo-config inputs CANNOT apt-install — cross-gem@v1.4.4 runs the
 #   build in a fixed rb-sys-dock image with no in-container hook. An [env] only helps if
 #   the tool already exists in the image (clang/llvm/cmake/cross-sysroot yes; protoc/
-#   gfortran no). A gem needing an absent linux package must toggle that leg off.
+#   gfortran no). A gem needing an absent linux package either toggles that leg off OR
+#   pre-seeds a deps-enriched cross image via linux-cross-image-repo (see that input).
 #
 # SECRETS
 #   rubygems-api-key    OPTIONAL. Mapped into GEM_HOST_API_KEY by every push step.
@@ -156,10 +162,20 @@ on:
         required: false
         default: ""
       darwin-pre-build-command:
-        description: "OPTIONAL shell run on EACH darwin-build leg BEFORE compile-command (e.g. `brew install protobuf` for a prost/protoc consumer, or extra C-lib deps for a bundled-C gem). Empty default => skip (correct for red-candle and every plain gem). macos-26 ships Homebrew, so this is the supported darwin escape hatch for a native system build dep. The LINUX legs have NO equivalent hook: cross-gem@v1.4.4 runs the build inside a fixed rb-sys-dock image with no in-container apt step, so a linux system package that the image lacks (protoc, gfortran, leptonica/tesseract dev) cannot be installed here — toggle that leg off and ship the source gem for it."
+        description: "OPTIONAL shell run on EACH darwin-build leg BEFORE compile-command (e.g. `brew install protobuf` for a prost/protoc consumer, or extra C-lib deps for a bundled-C gem). Empty default => skip (correct for red-candle and every plain gem). macos-26 ships Homebrew, so this is the supported darwin escape hatch for a native system build dep. The LINUX legs have NO equivalent hook: cross-gem@v1.4.4 runs the build inside a fixed rb-sys-dock image with no in-container apt step, so a linux system package that the image lacks (protoc, gfortran, leptonica/tesseract dev) cannot be installed here — toggle that leg off OR pre-seed a deps-enriched cross image via linux-cross-image-repo."
         type: string
         required: false
         default: ""
+      linux-cross-image-repo:
+        description: "OPTIONAL GHCR repo of a DEPS-ENRICHED rb-sys cross image to pre-seed onto the runner's Docker daemon BEFORE cross-gem runs, so rb-sys-dock builds against OUR image (with the extra system build-deps) instead of the stock rbsys/<platform>:<tag> it would pull. Empty default => NO-OP (every existing caller is byte-identical to before). When set (e.g. ghcr.io/scientist-labs/rust-gem-cross — built by this repo's build-cross-images.yml), each enabled linux leg runs `docker pull <repo>:<platform>` then `docker tag <repo>:<platform> rbsys/<platform>:<linux-cross-image-tag>`, so rb-sys-dock finds the image locally (`docker images -q` hit) and SKIPS its pull. The image MUST be FROM rbsys/<platform>:<tag> (preserves the whole cross toolchain) and PUBLIC (consumer runners pull with no auth). The :<tag> is load-bearing: it must equal the rb_sys gem version each gem resolves (pin each gem's Cargo.lock to that rb-sys), or rb-sys-dock computes a different rbsys/<platform>:<other> name and the pre-seed is bypassed. This is the LINUX analogue of darwin-pre-build-command and the only mechanism that adds an absent linux system package (protoc, gfortran, OpenBLAS, leptonica/tesseract) without forking cross-gem."
+        type: string
+        required: false
+        default: ""
+      linux-cross-image-tag:
+        description: "The rb-sys version :tag the pre-seeded image is re-tagged to as rbsys/<platform>:<this>. MUST equal the rb_sys gem version each consumer gem resolves (the value rb-sys-dock derives the image name from). Default 0.9.128 matches the build-cross-images.yml image and the current crates.io rb-sys max_stable. Only consulted when linux-cross-image-repo is non-empty."
+        type: string
+        required: false
+        default: "0.9.128"
       job-timeout-minutes:
         description: "OPTIONAL per-job timeout (minutes) for the heavy build legs (linux-gems, darwin-build, darwin-package). Default 360 = GitHub's own default, so existing behavior is unchanged. Raise it for a heavy-C++ consumer (RocksDB, MuPDF/Tesseract, from-source OpenBLAS) whose per-ABI compile can approach the limit; lower it to fail a hung build faster. Source-gem and prepare/collect are light and deliberately not gated."
         type: number
@@ -465,6 +481,33 @@ jobs:
       - name: Ensure cargo cache dirs exist (rb-sys-dock bind-mount source)
         if: steps.leg.outputs.enabled == 'true'
         run: mkdir -p ~/.cargo/registry ~/.cargo/git
+      # OPTIONAL pre-seed of a DEPS-ENRICHED rb-sys cross image. cross-gem@v1.4.4
+      # runs `rb-sys-dock --platform <p> --build`, which computes the image name
+      # rbsys/<platform>:<rb_sys version> and only pulls it when `docker images -q`
+      # finds it absent. By pulling OUR enriched image and re-tagging it to exactly
+      # that name FIRST, rb-sys-dock finds it locally, SKIPS its pull, and builds
+      # against the image that carries the extra system deps (protoc / OpenBLAS /
+      # leptonica-tesseract). The :<tag> MUST equal the rb_sys version this gem
+      # resolves (pin its Cargo.lock), else rb-sys-dock derives a different name and
+      # this re-tag is bypassed. NO-OP when linux-cross-image-repo is empty, so every
+      # existing caller is byte-identical to before. This is the linux analogue of
+      # darwin-pre-build-command — the one mechanism that adds an absent linux system
+      # package without forking cross-gem.
+      - name: Pre-seed deps-enriched rb-sys cross image (when linux-cross-image-repo set)
+        if: ${{ steps.leg.outputs.enabled == 'true' && inputs.linux-cross-image-repo != '' }}
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          IMAGE_REPO: ${{ inputs.linux-cross-image-repo }}
+          IMAGE_TAG: ${{ inputs.linux-cross-image-tag }}
+        run: |
+          set -euo pipefail
+          src="${IMAGE_REPO}:${PLATFORM}"
+          dst="rbsys/${PLATFORM}:${IMAGE_TAG}"
+          echo "==> pulling enriched cross image $src"
+          docker pull "$src"
+          echo "==> re-tagging $src -> $dst so rb-sys-dock uses it (skips its own pull)"
+          docker tag "$src" "$dst"
+          docker images "rbsys/${PLATFORM}"
       - uses: oxidize-rb/actions/cross-gem@e5f9a49a7812a078584072f6e3f657ad247c8771 # v1.4.4
         if: steps.leg.outputs.enabled == 'true'
         id: cross-gem

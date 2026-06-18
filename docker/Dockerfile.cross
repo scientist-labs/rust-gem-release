@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1
+#
+# Deps-enriched rb-sys cross-compile image. See
+# .github/workflows/build-cross-images.yml for the full rationale.
+#
+# FROM rbsys/<platform>:<rb_sys version> so the entire rb-sys cross toolchain is
+# preserved (RUBY_CC_VERSION, cross sysroot + libc6-*-cross, clang/llvm-12, cmake,
+# pkg-config, rustup/cargo, BINDGEN_EXTRA_CLANG_ARGS_*). The rb-sys base is itself
+# FROM rake-compiler-dock (ubuntu:20.04 Focal), so these are Focal apt names and
+# `apt-get update` is required first. We only ADD packages — nothing is removed.
+#
+# RBSYS_TAG must equal the rb_sys GEM version every consumer gem resolves; that is
+# the :tag rb-sys-dock computes for rbsys/<platform>:<tag>, and the pre-seed
+# `docker tag` in the consumer release workflow re-points exactly that name.
+
+ARG PLATFORM=x86_64-linux
+ARG RBSYS_TAG=0.9.128
+FROM rbsys/${PLATFORM}:${RBSYS_TAG}
+
+# Link the published GHCR package to its source repo (package page + inherited
+# repo permissions). Must sit right under FROM to bind to this image.
+LABEL org.opencontainers.image.source=https://github.com/scientist-labs/rust-gem-release
+LABEL org.opencontainers.image.description="rb-sys cross image + system build deps (protoc, OpenBLAS/LAPACK+gfortran, leptonica/tesseract) for scientist-labs Rust gems"
+
+# UNION system build deps serving lancelot (protoc), clusterkit (OpenBLAS/LAPACK +
+# gfortran), and parsekit (leptonica/tesseract, forward-compat). apt-get install is
+# idempotent; cmake/pkg-config/clang already ship in the rcd base and are omitted.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        protobuf-compiler \
+        gfortran \
+        libopenblas-dev \
+        liblapack-dev \
+        libleptonica-dev \
+        libtesseract-dev \
+        tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
