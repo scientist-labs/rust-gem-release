@@ -29,11 +29,14 @@ on:
       ruby-versions:
         description: >-
           Comma-separated Ruby versions to run the PR build against (one matrix
-          leg each). PR CI does not need the full release ABI set; default to the
-          floor + current GA so a break on either edge surfaces.
+          leg each). PR CI does not need the full release ABI set; default to a
+          stable low+high pair so a break on either edge surfaces. Ruby 4.0 is
+          intentionally excluded from the default (its C API breaks gems on older
+          magnus/rb_sys — rb_sys::RTypedData.typed_flag); add it once the gem's
+          native deps support 4.0, matching the gem's release ruby-versions.
         type: string
         required: false
-        default: "3.4,4.0"
+        default: "3.3,3.4"
       runs-on:
         description: >-
           Linux runner label for every matrix leg (e.g. ubuntu-latest,
