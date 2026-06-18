@@ -597,8 +597,36 @@ jobs:
           echo "  $DARWIN_PRE_BUILD_COMMAND"
           eval "$DARWIN_PRE_BUILD_COMMAND" \
             || { echo "::error::darwin-pre-build-command failed (exit $?). Check the command and its quoting."; exit 1; }
+      # Per-ABI Cargo cache so a darwin leg does not recompile the entire Rust
+      # dependency tree cold on every run (the dominant cost here). Mirrors the
+      # proven build.yml pattern: registry/git index + the rb-sys build tmp
+      # (rake-compiler/rb_sys drop the native target dirs under tmp/). Keyed per
+      # matrix Ruby ABI so ABIs do not clobber each other's compiled artifacts,
+      # with a prefix restore-key for a partial hit on a Cargo.lock change.
+      - name: Restore Cargo cache
+        id: cargo-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tmp
+          key: macos-cargo-${{ matrix.ruby }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            macos-cargo-${{ matrix.ruby }}-
       - name: Compile native extension
         run: ${{ inputs.compile-command }}
+      - name: Save Cargo cache
+        # Only on a miss, and even if a later step fails, so a slow cold compile
+        # is not repaid on the next run.
+        if: always() && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tmp
+          key: macos-cargo-${{ matrix.ruby }}-${{ hashFiles('**/Cargo.lock') }}
       - name: Relocate bundle into Ruby-ABI subdir
         env:
           MINOR: ${{ matrix.ruby }}
