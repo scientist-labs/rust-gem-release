@@ -121,10 +121,10 @@ on:
         required: false
         default: "ruby -r./lib/candle/version -e 'print Candle::VERSION'"
       ruby-versions:
-        description: "Comma-separated Ruby ABI set compiled into every fat gem. SINGLE SOURCE OF TRUTH: prepare derives the CSV (cross-gem), a JSON array (darwin matrix), and a space-list (darwin verify loop) from this one value."
+        description: "Comma-separated Ruby ABI set compiled into every fat gem. SINGLE SOURCE OF TRUTH: prepare derives the CSV (cross-gem), a JSON array (darwin matrix), and a space-list (darwin verify loop) from this one value. Default is the stable, broadly-supported set 3.1-3.4. Ruby 4.0 is NOT in the default: its C API changed (e.g. rb_sys::RTypedData.typed_flag) and a gem must be on a 4.0-capable magnus/rb_sys to compile against it; add '4.0' explicitly once the gem's native deps support it (red-candle does)."
         type: string
         required: false
-        default: "3.1,3.2,3.3,3.4,4.0"
+        default: "3.1,3.2,3.3,3.4"
       compile-command:
         description: "Native macOS compile entrypoint on darwin-build (one .bundle per ABI), the rake-compiler/rb_sys common case. The linux legs do NOT use this (oxidize-rb cross-gem owns the linux build)."
         type: string
@@ -456,6 +456,15 @@ jobs:
           printf '%s' "$CONFIG" > .cargo/config.toml
           echo "Wrote .cargo/config.toml for $PLATFORM:"
           cat .cargo/config.toml
+      # rb-sys-dock (inside cross-gem) bind-mounts ~/.cargo/registry and ~/.cargo/git
+      # into the build container. On a runner where no cargo command has populated
+      # them yet (e.g. a gem with no committed Gemfile.lock, so cross-gem's own setup
+      # skips creating them), the bind source path is missing and `docker run` aborts
+      # with exit 125 (`bind source path does not exist: /home/runner/.cargo/registry`).
+      # Pre-create the dirs so the mount always has a valid (possibly empty) source.
+      - name: Ensure cargo cache dirs exist (rb-sys-dock bind-mount source)
+        if: steps.leg.outputs.enabled == 'true'
+        run: mkdir -p ~/.cargo/registry ~/.cargo/git
       - uses: oxidize-rb/actions/cross-gem@e5f9a49a7812a078584072f6e3f657ad247c8771 # v1.4.4
         if: steps.leg.outputs.enabled == 'true'
         id: cross-gem
