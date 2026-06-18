@@ -45,11 +45,11 @@ name: Reusable Rust Gem Release
 #   linux-cargo-config  OPTIONAL .cargo/config.toml text, written on BOTH linux legs (base).
 #   aarch64-cargo-config OPTIONAL .cargo/config.toml text, written on the aarch64-linux leg ONLY.
 #   darwin-pre-build-command OPTIONAL shell run on each darwin leg BEFORE compile (e.g. brew install).
-#   linux-extra-apt     OPTIONAL apt packages added to the rb-sys cross image (built inline,
+#   linux-image-setup   OPTIONAL shell snippet RUN into the rb-sys cross image (built inline,
 #                       FROM rbsys/<platform>:<tag>) before each enabled linux leg. Empty ->
-#                       no-op. The LINUX system-dep hook (analogue of darwin-pre-build-command).
+#                       no-op. The LINUX system-dep hook (apt / download tool / multiarch).
 #   linux-rbsys-tag     rb_sys :tag the inline image is tagged as (default 0.9.128); must == each
-#                       gem's resolved rb_sys version. Only used when linux-extra-apt is set.
+#                       gem's resolved rb_sys version. Only used when linux-image-setup is set.
 #   job-timeout-minutes OPTIONAL per-job timeout for the heavy build legs (default 360).
 #   darwin-verify-cmd   OPTIONAL extra shell run per darwin leg, with $BUNDLE exported.
 #   publish             Intent gate for `gem push` (default FALSE). A caller threads
@@ -59,7 +59,7 @@ name: Reusable Rust Gem Release
 #   build in a fixed rb-sys-dock image with no in-container hook. An [env] only helps if
 #   the tool already exists in the image (clang/llvm/cmake/cross-sysroot yes; protoc/
 #   gfortran no). A gem needing an absent linux package either toggles that leg off OR
-#   adds it via linux-extra-apt (inline-built into the cross image; see that input).
+#   adds it via linux-image-setup (inline-built into the cross image; see that input).
 #
 # SECRETS
 #   rubygems-api-key    OPTIONAL. Mapped into GEM_HOST_API_KEY by every push step.
@@ -162,17 +162,17 @@ on:
         required: false
         default: ""
       darwin-pre-build-command:
-        description: "OPTIONAL shell run on EACH darwin-build leg BEFORE compile-command (e.g. `brew install protobuf` for a prost/protoc consumer, or extra C-lib deps for a bundled-C gem). Empty default => skip (correct for red-candle and every plain gem). macos-26 ships Homebrew, so this is the supported darwin escape hatch for a native system build dep. The LINUX legs have NO equivalent hook: cross-gem@v1.4.4 runs the build inside a fixed rb-sys-dock image with no in-container apt step, so a linux system package that the image lacks (protoc, gfortran, leptonica/tesseract dev) cannot be installed here — toggle that leg off OR add it via linux-extra-apt (inline-built into the cross image)."
+        description: "OPTIONAL shell run on EACH darwin-build leg BEFORE compile-command (e.g. `brew install protobuf` for a prost/protoc consumer, or extra C-lib deps for a bundled-C gem). Empty default => skip (correct for red-candle and every plain gem). macos-26 ships Homebrew, so this is the supported darwin escape hatch for a native system build dep. The LINUX legs have NO equivalent hook: cross-gem@v1.4.4 runs the build inside a fixed rb-sys-dock image with no in-container apt step, so a linux system package that the image lacks (protoc, gfortran, leptonica/tesseract dev) cannot be installed here — toggle that leg off OR add it via linux-image-setup (inline-built into the cross image)."
         type: string
         required: false
         default: ""
-      linux-extra-apt:
-        description: "OPTIONAL space-separated apt packages to add to the rb-sys cross image before each enabled linux leg (the LINUX analogue of darwin-pre-build-command). Empty default => NO-OP (every existing caller is byte-identical). When set, the leg builds an enriched image INLINE on the runner: `FROM rbsys/<platform>:<linux-rbsys-tag>` + apt-install these packages, re-tagged to that SAME name, so cross-gem's rb-sys-dock (which only pulls the image when `docker images -q` finds it absent) builds against OUR enriched image. Self-contained — no registry, no auth. Use for an absent linux build-dep: e.g. 'protobuf-compiler' (prost/protoc), 'gfortran libopenblas-dev liblapack-dev' (system OpenBLAS). NOTE: packages install for the cross image's apt arch (amd64); a host build-TOOL like protoc serves both target legs, but a TARGET link library for the aarch64 leg may need an arm64-sysroot variant, not a plain apt install."
+      linux-image-setup:
+        description: "OPTIONAL shell snippet run as a single `RUN` inside an inline-built rb-sys cross image, before each enabled linux leg (the LINUX analogue of darwin-pre-build-command). Empty default => NO-OP (every existing caller is byte-identical). When set, the leg builds `FROM rbsys/<platform>:<linux-rbsys-tag>` + `RUN <this>`, re-tagged to that SAME name, so cross-gem's rb-sys-dock (which only pulls the image when `docker images -q` finds it absent) builds against OUR enriched image. Self-contained — no registry, no auth. More general than apt: use it to apt-install ('apt-get update && apt-get install -y gfortran libopenblas-dev liblapack-dev'), download a build tool ('curl -fsSL .../protoc-*-linux-x86_64.zip -o /tmp/p.zip && unzip -o /tmp/p.zip -d /usr/local'), or stage arm64 multiarch libs ('dpkg --add-architecture arm64 && ... && apt-get install -y libopenblas-dev:arm64'). Newlines are collapsed to spaces, so write a single &&-joined pipeline (a YAML block scalar is fine). NOTE: the cross image is amd64; a host build-TOOL (protoc) serves both target legs, but a TARGET link library for the aarch64 leg needs its arm64 multiarch variant."
         type: string
         required: false
         default: ""
       linux-rbsys-tag:
-        description: "The rb_sys version :tag the inline-built cross image is tagged as (rbsys/<platform>:<this>) — MUST equal the rb_sys gem version each consumer gem resolves (the name rb-sys-dock derives and looks up locally). Default 0.9.128 = current crates.io rb-sys max_stable; pin each gem's Cargo.lock to match. Only consulted when linux-extra-apt is non-empty."
+        description: "The rb_sys version :tag the inline-built cross image is tagged as (rbsys/<platform>:<this>) — MUST equal the rb_sys gem version each consumer gem resolves (the name rb-sys-dock derives and looks up locally). Default 0.9.128 = current crates.io rb-sys max_stable; pin each gem's Cargo.lock to match. Only consulted when linux-image-setup is non-empty."
         type: string
         required: false
         default: "0.9.128"
@@ -491,20 +491,22 @@ jobs:
       # Self-contained: no registry, no auth, no separate image-build workflow. The
       # :<tag> MUST equal the rb_sys version this gem resolves (pin its Cargo.lock),
       # else rb-sys-dock derives a different name and this is bypassed. NO-OP when
-      # linux-extra-apt is empty, so every existing caller is byte-identical. This is
+      # linux-image-setup is empty, so every existing caller is byte-identical. This is
       # the linux analogue of darwin-pre-build-command.
-      - name: Build deps-enriched rb-sys cross image (when linux-extra-apt set)
-        if: ${{ steps.leg.outputs.enabled == 'true' && inputs.linux-extra-apt != '' }}
+      - name: Build deps-enriched rb-sys cross image (when linux-image-setup set)
+        if: ${{ steps.leg.outputs.enabled == 'true' && inputs.linux-image-setup != '' }}
         env:
           PLATFORM: ${{ matrix.platform }}
           IMAGE_TAG: ${{ inputs.linux-rbsys-tag }}
-          EXTRA_APT: ${{ inputs.linux-extra-apt }}
+          IMAGE_SETUP: ${{ inputs.linux-image-setup }}
         run: |
           set -euo pipefail
           img="rbsys/${PLATFORM}:${IMAGE_TAG}"
-          echo "==> building enriched $img (FROM $img + apt: ${EXTRA_APT})"
-          printf 'FROM %s\nRUN apt-get update && apt-get install -y --no-install-recommends %s && rm -rf /var/lib/apt/lists/*\n' \
-            "$img" "$EXTRA_APT" > /tmp/Dockerfile.cross
+          # Collapse newlines so a multi-line YAML scalar becomes one RUN line
+          # (callers join steps with && / ;). Then build FROM the stock image + RUN.
+          setup="$(printf '%s' "$IMAGE_SETUP" | tr '\n' ' ')"
+          echo "==> building enriched $img (FROM $img)"
+          { printf 'FROM %s\n' "$img"; printf 'RUN %s\n' "$setup"; } > /tmp/Dockerfile.cross
           cat /tmp/Dockerfile.cross
           docker build -t "$img" - < /tmp/Dockerfile.cross
           docker images "rbsys/${PLATFORM}"
