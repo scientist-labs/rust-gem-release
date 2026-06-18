@@ -61,15 +61,34 @@ permissions:
   contents: read
 
 jobs:
+  # GitHub Actions expressions have NO string split/replace function, so a CSV
+  # input cannot be turned into a matrix array inline (the old
+  # `replace(inputs.ruby-versions, ...)` form fails to compile -> 0s "workflow
+  # file issue"). Derive the JSON array in a tiny setup job (system ruby is
+  # preinstalled on the runner), exactly as release.yml's prepare job does, and
+  # fan the build matrix out of it.
+  setup:
+    runs-on: ${{ inputs.runs-on }}
+    outputs:
+      ruby-json: ${{ steps.rubies.outputs.json }}
+    steps:
+      - name: Derive Ruby-version JSON array from the CSV input
+        id: rubies
+        env:
+          RUBY_VERSIONS: ${{ inputs.ruby-versions }}
+        run: |
+          JSON="$(ruby -rjson -e 'print ARGV[0].split(",").map(&:strip).to_json' "$RUBY_VERSIONS")"
+          echo "json=$JSON" >> "$GITHUB_OUTPUT"
+          echo "ruby-json=$JSON"
+
   build:
+    needs: setup
     runs-on: ${{ inputs.runs-on }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     strategy:
       fail-fast: false
       matrix:
-        # Comma-separated input -> JSON array for the matrix. fromJSON over a
-        # mapped CSV is the GHA-idiomatic way to make a string input fan out.
-        ruby-version: ${{ fromJSON(format('["{0}"]', replace(inputs.ruby-versions, ',', '","'))) }}
+        ruby-version: ${{ fromJSON(needs.setup.outputs.ruby-json) }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
