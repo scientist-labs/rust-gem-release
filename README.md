@@ -51,7 +51,7 @@ jobs:
   release:
     permissions:
       contents: write              # REQUIRED — the workflow can only reduce, never raise, this
-    uses: scientist-labs/rust-gem-release/.github/workflows/release.yml@v0
+    uses: scientist-labs/rust-gem-release/.github/workflows/release.yml@0.10.0
     with:
       gem-name: parsekit
       version-command: ruby -r./lib/parsekit/version -e 'print Parsekit::VERSION'
@@ -306,7 +306,7 @@ on:
 jobs:
   release:
     permissions: { contents: write }
-    uses: scientist-labs/rust-gem-release/.github/workflows/release.yml@v0
+    uses: scientist-labs/rust-gem-release/.github/workflows/release.yml@0.10.0
     with:
       # tag push -> the input is unset -> the workflow default (false) applies;
       # dispatch -> the maintainer's choice flows through.
@@ -330,7 +330,7 @@ macOS+Linux, or model `needs`/per-job permissions. The entry file ships as
 `.github/workflows/release.yml`, and the name leaves room for a sibling PR-CI reusable
 workflow (`.github/workflows/build.yml`) in the same repo.
 
-`0.1.0` is the **first release**. Callers pin **`@v0`** — a **moving major tag**, advanced
+`0.1.0` is the **first release**. Callers pin **`@0.10.0`** — a **moving major tag**, advanced
 as the org rollout hardens the workflow, so an interface-widening reaches all callers at
 once. For reproducibility you may instead pin the **immutable `@0.1.0`** point release (or,
 for supply-chain parity with the SHA-pinned actions inside this workflow, SHA-pin
