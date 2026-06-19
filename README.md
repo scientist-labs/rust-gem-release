@@ -96,7 +96,9 @@ That's it for a gem where `gem-name == gemspec basename == extension dir` (true 
 | `linux-cross-image-tag` | string | no | `0.9.128` | The `rb_sys` version `:tag` the pre-seeded image is re-tagged to as `rbsys/<platform>:<this>`. MUST equal the `rb_sys` gem version each consumer gem resolves (the value rb-sys-dock derives the image name from). Default `0.9.128` matches `build-cross-images.yml` and the current crates.io `rb-sys` max_stable. Only consulted when `linux-cross-image-repo` is non-empty. |
 | `job-timeout-minutes` | number | no | `360` | **Optional** per-job timeout for the heavy build legs (`linux-gems`, `darwin-build`, `darwin-package`). Default `360` = GitHub's own default, so existing runs are unchanged. Raise it for a heavy-C++ consumer (RocksDB, MuPDF/Tesseract, from-source OpenBLAS) whose per-ABI compile can approach the limit; lower it to fail a hung build faster. `prepare`/`source-gem`/`collect` are light and not gated. |
 | `darwin-verify-cmd` | string | no | `""` (skip) | **Optional** extra shell run on each `darwin-build` leg after compile+relocate, with `$BUNDLE` exported as the freshly-relocated `lib/<ext-name>/<minor>/<ext-name>.bundle`. Empty default skips it (correct for plain CPU-only gems). red-candle asserts framework linkage via `otool -L "$BUNDLE" \| grep -Eiq '(Metal\|Accelerate)\.framework'`. The arm64 architecture check (`file "$BUNDLE" \| grep -q arm64`) **always runs and is hardcoded** — only the framework grep is gem-specific. |
-| `publish` | boolean | no | `false` | **Intent gate** for `gem push`. Lives in `inputs` (not `secrets`) so it is legal in step `if:` and bash guards. **Default `false`** per the safety mandate: a tag still builds all gems, runs `gem build`, and creates/attaches the GitHub Release, but **skips the RubyGems push**, emitting a loud `::notice::`. Set `true` **and** supply the secret to actually publish. A caller threads this from its own `workflow_dispatch` boolean to drive an on-demand **dry-run** (every leg builds; the Release + attach steps are skipped on any non-`push` event) — see [Publishing](#publishing). |
+| `publish` | boolean | no | `false` | **Intent gate** for `gem push`. Lives in `inputs` (not `secrets`) so it is legal in step `if:` and bash guards. **Default `false`** per the safety mandate: a tag still builds all gems, runs `gem build`, and creates/attaches the GitHub Release, but **skips the RubyGems push**, emitting a loud `::notice::`. Set `true` **and** supply the secret to actually publish. A caller threads this from its own `workflow_dispatch` boolean to drive an on-demand **dry-run** (every leg builds; the Release + attach steps are skipped on a version-less dispatch) — see [Publishing](#publishing). |
+| `version` | string | no | `""` | **Optional** — the **"type a version in a box"** path. When **non-empty on a `workflow_dispatch` run**, `prepare` writes it into the gem's version file via `bump-command`, commits `Release <v>`, cuts+pushes the bare tag `<v>`, and releases that version **in the same run** (build legs check out the bumped commit; the GitHub Release is created; RubyGems push still obeys `publish`). The tag is pushed with the run's `GITHUB_TOKEN`, which GitHub does **not** use to trigger further workflows, so it never re-fires the caller's `on: push: tags` (**no double release, no PAT**). Ignored on a `push` event and when empty. **Requires `bump-command`.** ⚠️ It **mutates the repo** (commit/tag/Release) even with `publish: false` — for a side-effect-free dry-run use a version-less dispatch. The no-double-release guarantee assumes the **default** `GITHUB_TOKEN` (a PAT/App token would re-trigger). The tag is cut **before** the build, so a build failure leaves a tagged-but-partially-shipped version — **re-dispatch the same version to complete it** (the bump no-ops and every push is idempotent). |
+| `bump-command` | string | no | `""` | **Optional**, required only to use the `version` input. Shell command that writes the `version` input into the gem's version file; the target is exported as `$VERSION`. After it runs, `prepare` re-runs `version-command` and **asserts it prints exactly `$VERSION`** (catches a wrong file/constant/quoting before anything is committed). Mirrors `version-command`'s split — the gem-specific *write* lives in the caller, the workflow stays generic. Example: `sed -i "s/^\( *VERSION *= *\).*/\1\"$VERSION\"/" lib/topical/version.rb`. |
 | `build-darwin` | boolean | no | `true` | Toggle the native `arm64-darwin` legs (`darwin-build` + `darwin-package`) together, via job-level `if: inputs.build-darwin` on both. Off ⇒ a token-less or Linux-only gem still ships source + the two linux platforms. The native `macos-26` path is hardcoded (the Docker/osxcross cross path yields CPU-only darwin). |
 | `build-x86_64-linux` | boolean | no | `true` | Toggle the `x86_64-linux` precompiled leg, via a per-step guard inside the `linux-gems` matrix (you cannot job-`if` a single matrix include). Off ⇒ amd64 users fall through to the source gem. `fail-fast: false` keeps one leg's flake from cancelling the other. |
 | `build-aarch64-linux` | boolean | no | `true` | Toggle the `aarch64-linux` (cross-compiled on the `x86_64` host) leg, same per-step-guard mechanism. Off ⇒ arm64-linux users fall through to the source gem. The cross-on-x86_64 topology is **hardcoded** (a native arm runner trips cross-gem v1.4.4's `cargo-binstall` `KeyError aarch64-unknown-linux-musl`). |
@@ -277,27 +279,49 @@ secrets:
   rubygems-api-key: ${{ secrets.RUBYGEMS_API_KEY }}
 ```
 
-### Two event paths: tag push (real release) vs `workflow_dispatch` (dry-run)
+### Three event paths: tag push, `workflow_dispatch` + version, version-less dry-run
 
-The workflow branches on `github.event_name`, so the same reusable workflow serves both
-the real release and a maintainer-triggered dry-run:
+`prepare` resolves the event into three threaded outputs — `is-release`, `ref-name`,
+`sha` — that the build legs key off (they no longer test `github.event_name` directly),
+so the same reusable workflow serves the CLI release, the "type a version in a box"
+release, and a maintainer dry-run:
 
-| | **`push` (a version tag)** | **`workflow_dispatch` (a branch)** |
-| --- | --- | --- |
-| `prepare` version | `GITHUB_REF_NAME` (v-stripped), **guarded** `== version-command` | taken **straight from `version-command`** (no tag guard — `GITHUB_REF_NAME` is the branch, not a version) |
-| All four build legs | build | **build** (validate `gem build` + cross-gem + fat-gem assembly) |
-| GitHub Release + every "Attach to Release" step | created/updated | **skipped** (gated `github.event_name == 'push'`) — no junk Release named after the branch |
-| RubyGems push | per the `publish` triad above | per the `publish` triad (callers default `publish: false`, so **none**) |
+| | **`push` (a version tag)** — CLI | **`workflow_dispatch` + `version`** — the box | **`workflow_dispatch`, no version** — dry-run |
+| --- | --- | --- | --- |
+| How you trigger it | `git tag X && git push --tags` | type a version in the Actions "Run workflow" form | run the workflow with `version` blank |
+| Version source | pushed tag, **guarded** `== version-command` | the `version` input, **written via `bump-command`** + committed + tagged in-run | `version-command` (no tag guard) |
+| Build legs check out | the tagged commit (`github.sha`) | the **bumped commit** | the branch tip (`github.sha`) |
+| GitHub Release + attach | created/updated | **created/updated** (at the bare tag cut this run) | **skipped** — no junk Release named after the branch |
+| RubyGems push | per the `publish` triad | per the `publish` triad | per the `publish` triad (none unless `publish: true`) |
+| Repo mutation | the tag you pushed | **commit + tag + Release** (even with `publish: false`) | none |
 
-A `workflow_dispatch` run is therefore a **full-matrix DRY-RUN**: every leg builds, but
-it touches **neither RubyGems nor a GitHub Release**. To wire it, the caller adds the
-trigger and a `publish` boolean (default `false`) it threads into `with.publish`:
+The middle column is the new path: a maintainer types a version into the GitHub Actions
+UI and the workflow bumps `version.rb`, commits, tags, and releases it — **no local
+checkout, no tag push from a laptop**. The tag is pushed with the run's own
+`GITHUB_TOKEN`, whose events GitHub does **not** use to start new workflow runs, so it
+never re-fires the `on: push: tags` trigger (**no double release, no PAT**).
+
+> ⚠️ Typing a version **mutates the repo** (commit + tag + Release) even with
+> `publish: false` — only the RubyGems push is gated by `publish`. For a side-effect-free
+> dry-run, leave `version` blank (the third column). The no-double-release guarantee
+> assumes the **default** `GITHUB_TOKEN`; the tag is cut **before** the build, so a build
+> failure leaves a tagged-but-partial version — **re-dispatch the same version** to
+> complete it (idempotent). The job must be able to push to the branch (`contents: write`
+> + no blocking branch protection).
+
+To wire all three, the caller adds the trigger, a `publish` boolean, an optional
+`version` box, and passes `version`/`bump-command` through:
 
 ```yaml
 on:
-  push: { tags: [ "[0-9]+.[0-9]+.[0-9]+", "v[0-9]+.[0-9]+.[0-9]+" ] }
+  push: { tags: [ "[0-9]+.[0-9]+.[0-9]+", "[0-9]+.[0-9]+.[0-9]+.*",
+                  "v[0-9]+.[0-9]+.[0-9]+", "v[0-9]+.[0-9]+.[0-9]+.*" ] }
   workflow_dispatch:
     inputs:
+      version:
+        description: "Version to cut + release, e.g. 0.2.0 (blank = build-only dry-run)"
+        type: string
+        default: ""
       publish:
         description: "Push to RubyGems (leave false for a dry-run)"
         type: boolean
@@ -306,16 +330,25 @@ on:
 jobs:
   release:
     permissions: { contents: write }
-    uses: scientist-labs/rust-gem-release/.github/workflows/release.yml@0.10.0
+    # Pin to the first release that ships the `version` box (cut after this lands).
+    uses: scientist-labs/rust-gem-release/.github/workflows/release.yml@0.11.0
     with:
-      # tag push -> the input is unset -> the workflow default (false) applies;
-      # dispatch -> the maintainer's choice flows through.
+      gem-name: topical
+      version-command: ruby -r./lib/topical/version -e 'print Topical::VERSION'
+      # the box: write the typed version into version.rb ($VERSION is exported by
+      # the reusable workflow; pass it through literally, NOT via ${{ }}).
+      version: ${{ inputs.version }}
+      bump-command: |
+        sed -i 's/^\( *VERSION *= *\).*/\1"'"$VERSION"'"/' lib/topical/version.rb
+      # tag push -> input unset -> default false; dispatch -> maintainer's choice
       publish: ${{ github.event_name == 'push' || inputs.publish }}
-      # ...gem-name, version-command, etc.
+    secrets:
+      rubygems-api-key: ${{ secrets.RUBYGEMS_API_KEY }}
 ```
 
-The tag-push path is **unchanged** — byte-identical to the always-publish release of
-prior versions.
+The tag-push and version-less dispatch paths are **unchanged** — byte-identical to prior
+versions (the new `version`/`bump-command` inputs default empty, and `prepare`'s outputs
+resolve to exactly the old values on those paths).
 
 ---
 

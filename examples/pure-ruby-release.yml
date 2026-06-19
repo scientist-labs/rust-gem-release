@@ -1,0 +1,71 @@
+name: Release
+
+# ============================================================================
+# Template caller for a PURE-RUBY gem (no native extension) — e.g. topical,
+# ragnar-cli, thor-interactive, rrf, ruby_llm-red_candle.
+#
+# The same shared workflow that builds the Rust gems publishes a pure-Ruby gem
+# too: turn the three native legs OFF and only the (mandatory, Rust-free)
+# source-gem job runs — `gem build` + `gem push` + GitHub Release, all on
+# ubuntu-24.04, zero macOS/cross-compile minutes.
+#
+# THREE ways to release, all from this one file:
+#   1. CLI .......... bump version.rb, commit, `git tag X && git push --tags`
+#   2. "version box". Actions tab -> Run workflow -> type a version (+ check
+#                     publish) -> the workflow bumps/commits/tags/publishes
+#   3. dry-run ...... Run workflow with version blank -> builds the gem, no
+#                     commit/tag/Release/push
+#
+# Copy this file to .github/workflows/release.yml in the gem repo and change:
+#   - gem-name, version-command, bump-command (the version file path/constant)
+#   - add the RUBYGEMS_API_KEY secret to the repo (Settings -> Secrets)
+# ============================================================================
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"        # release:    0.2.0
+      - "[0-9]+.[0-9]+.[0-9]+.*"      # prerelease: 0.2.0.pre1 (RubyGems dot form)
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to cut + release, e.g. 0.2.0 (blank = build-only dry-run)"
+        type: string
+        default: ""
+      publish:
+        description: "Push to RubyGems (leave false for a dry-run)"
+        type: boolean
+        default: false
+
+# A reusable workflow can only REDUCE the inherited token scope — so the caller
+# MUST grant contents: write (the bump-on-dispatch commit/tag and the GitHub
+# Release both need it), and the repo's default workflow token must not be
+# read-only. A protected default branch can also reject the bump push; cut from
+# a release branch or grant the token a bypass if so.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Pin to the first release that ships the `version` box (cut after this lands).
+    uses: scientist-labs/rust-gem-release/.github/workflows/release.yml@0.11.0
+    with:
+      gem-name: topical
+      version-command: ruby -r./lib/topical/version -e 'print Topical::VERSION'
+      # The "type a version in a box" path. `version` is empty on a tag push and
+      # on a version-less dispatch (no-op). $VERSION is exported by the reusable
+      # workflow for bump-command — pass it through literally, NOT via ${{ }}.
+      version: ${{ inputs.version }}
+      bump-command: |
+        sed -i 's/^\( *VERSION *= *\).*/\1"'"$VERSION"'"/' lib/topical/version.rb
+      # Pure-Ruby: no native extension, so turn every precompiled leg OFF. Only
+      # the source (ruby) gem is built + published.
+      build-darwin: false
+      build-x86_64-linux: false
+      build-aarch64-linux: false
+      # tag push -> input unset -> default false; dispatch -> maintainer's choice.
+      publish: ${{ github.event_name == 'push' || inputs.publish }}
+    secrets:
+      rubygems-api-key: ${{ secrets.RUBYGEMS_API_KEY }}
